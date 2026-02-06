@@ -248,7 +248,6 @@ def save_to_database(articles: List[Dict]):
         return
     
     conn = get_db_connection()
-    cur = conn.cursor()
     
     insert_query = """
         INSERT INTO competitor_data (
@@ -261,8 +260,11 @@ def save_to_database(articles: List[Dict]):
     """
     
     saved_count = 0
+    failed_count = 0
+    
     for article in articles:
         try:
+            cur = conn.cursor()
             cur.execute(insert_query, (
                 article['keyword'],
                 article['newstitle'],
@@ -273,16 +275,19 @@ def save_to_database(articles: List[Dict]):
                 article['competitor'],
                 article['scraped_content']
             ))
+            conn.commit()  # Commit after each successful insert
+            cur.close()
             saved_count += 1
         except Exception as e:
-            logging.error(f"Error saving article: {e}")
+            conn.rollback()  # Rollback the failed transaction
+            failed_count += 1
+            logging.error(f"Error saving article '{article.get('newstitle', 'Unknown')[:50]}...': {e}")
     
-    conn.commit()
-    cur.close()
     conn.close()
     
     logging.info(f"✅ Saved {saved_count} new articles to database")
-
+    if failed_count > 0:
+        logging.warning(f"⚠️  Failed to save {failed_count} articles")
 
 async def main_async():
     """Main async scraping function"""
