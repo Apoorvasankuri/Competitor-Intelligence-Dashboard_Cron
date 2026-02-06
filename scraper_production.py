@@ -1,18 +1,20 @@
 """
-Production News Scraper for Competitor Intelligence
-Scrapes Google News RSS feeds and saves to PostgreSQL
+Production News Scraper for Competitor Intelligence (v2 - Async)
+Scrapes Google News RSS feeds for competitor keywords and filters by SBU relevance
 """
 
+import asyncio
+import aiohttp
 import feedparser
 import psycopg
 from psycopg.rows import dict_row
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote
-import time
-import random
 import os
 import logging
+import re
+import pandas as pd
 from typing import List, Dict, Set
 
 # Configure logging
@@ -22,113 +24,162 @@ logging.basicConfig(
 )
 
 # Configuration
-DELAY_BETWEEN_REQUESTS = 2  # seconds
-RETRIES = 3
-LOOKBACK_DAYS = 1  # How many days back to scrape
-
-# SBU Detection Keywords (simplified - add more as needed)
-SBU_KEYWORDS = {
-    "India T&D": [
-        "transmission", "distribution", "T&D", "power grid", "substation",
-        "PGCIL", "PowerGrid", "NTPC", "switchgear", "transformer"
-    ],
-    "International T&D": [
-        "international transmission", "overseas grid", "export contract"
-    ],
-    "Transportation": [
-        "railway", "metro", "rail", "RVNL", "IRCON", "freight corridor"
-    ],
-    "Civil": [
-        "building", "water infrastructure", "industrial construction",
-        "defence infrastructure", "civil works"
-    ],
-    "Renewables": [
-        "solar", "wind", "renewable energy", "solar EPC", "wind farm"
-    ],
-    "Oil & Gas": [
-        "pipeline", "oil terminal", "gas pipeline", "petroleum"
-    ]
-}
-
-# Competitor Detection Keywords
-COMPETITOR_KEYWORDS = [
-    "L&T", "Larsen & Toubro", "Kalpataru", "Sterlite Power",
-    "Tata Projects", "NCC", "Siemens", "ABB", "Hitachi Energy",
-    "IRCON", "RVNL", "Sterling and Wilson"
-]
-
-# Core Keywords for scraping
-CORE_KEYWORDS = [
-    "transmission", "distribution", "substation", "railway", "metro",
-    "solar EPC", "wind power", "infrastructure", "civil construction",
-    "pipeline", "L&T", "Kalpataru", "Sterlite Power", "Tata Projects"
-]
+LOOKBACK_DAYS = 7
+MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests
+REQUEST_DELAY = 0.5  # Delay between requests in seconds
+EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
 
 
-def get_db_connection():
-    """Get database connection from environment variable"""
-    database_url = os.environ.get('DATABASE_URL')
-    if not database_url:
-        raise Exception("DATABASE_URL environment variable not set")
+def load_keywords_from_excel():
+    """Load SBU and Competitor keywords from Excel file"""
+    logging.info("Loading keywords from Excel file...")
     
-    return psycopg.connect(database_url, row_factory=dict_row)
+    # Read SBU sheet
+    sbu_df = pd.read_excel(EXCEL_FILE_PATH, sheet_name='SBU', header=1)
+    
+    sbu_keywords_dict = {}
+    all_sbu_keywords = set()
+    
+    for idx, row in sbu_df.iterrows():
+        sbu_name = row['SBU']
+        keywords_raw = row['Key Words']
+        
+        if pd.notna(sbu_name) and pd.notna(keywords_raw):
+            # Extract keywords between quotes
+            keywords = re.findall(r'"([^"]+)"', str(keywords_raw))
+            sbu_keywords_dict[sbu_name] = keywords
+            all_sbu_keywords.update(keywords)
+    
+    logging.info(f"Loaded {len(sbu_keywords_dict)} SBUs with {len(all_sbu_keywords)} unique keywords")
+    
+    # Read Competitor sheet
+    competitor_df = pd.read_excel(EXCEL_FILE_PATH, sheet_name='Competitor', header=1)
+    
+    competitor_keywords_list = []
+    competitor_to_sbu = {}
+    
+    for idx, row in competitor_df.iterrows():
+        sbu = row['SBU']
+        competitor = row['Competitor']
+        keywords_raw = row['Competitor Key Words']
+        
+        if pd.notna(competitor) and pd.notna(keywords_raw):
+            # Extract keywords between quotes
+            keywords = re.findall(r'"([^"]+)"', str(keywords_raw))
+            competitor_keywords_list.extend(keywords)
+            
+            # Map each keyword to its SBU and competitor name
+            for keyword in keywords:
+                if keyword not in competitor_to_sbu:
+                    competitor_to_sbu[keyword] = []
+                competitor_to_sbu[keyword].append({
+                    'sbu': sbu,
+                    'competitor': competitor
+                })
+    
+    # Get unique competitor keywords
+    unique_competitor_keywords = list(set(competitor_keywords_list))
+    
+    logging.info(f"Loaded {len(unique_competitor_keywords)} unique competitor keywords")
+    
+    return {
+        'sbu_keywords': list(all_sbu_keywords),
+        'competitor_keywords': unique_competitor_keywords,
+        'competitor_to_sbu': competitor_to_sbu,
+        'sbu_keywords_dict': sbu_keywords_dict
+    }
 
 
-def fetch_feed_safe(rss_url: str, keyword: str, retries: int = RETRIES):
-    """Safely fetch RSS feed with retries"""
-    for attempt in range(retries):
-        try:
-            feed = feedparser.parse(rss_url)
-            if feed.bozo and hasattr(feed, 'bozo_exception'):
-                logging.warning(f"Feed parse warning for '{keyword}': {feed.bozo_exception}")
-            return feed
-        except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed for '{keyword}': {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                return None
-
-
-def detect_sbu(title: str, source: str = "") -> str:
+def detect_sbu(title: str, source: str, sbu_keywords: List[str]) -> str:
     """Detect relevant SBUs from title and source"""
     text = f"{title} {source}".lower()
-    detected_sbus = []
+    detected_sbus = set()
     
-    for sbu, keywords in SBU_KEYWORDS.items():
-        if any(keyword.lower() in text for keyword in keywords):
-            detected_sbus.append(sbu)
+    for keyword in sbu_keywords:
+        if keyword.lower() in text:
+            detected_sbus.add(keyword)
     
-    return ", ".join(detected_sbus) if detected_sbus else ""
+    return ", ".join(sorted(detected_sbus)) if detected_sbus else ""
 
 
-def detect_competitor(title: str, source: str = "") -> str:
+def detect_competitor(title: str, source: str, competitor_to_sbu: Dict, competitor_keywords: List[str]) -> str:
     """Detect competitors mentioned in title/source"""
     text = f"{title} {source}".lower()
-    detected_competitors = []
+    detected_competitors = set()
     
-    for competitor in COMPETITOR_KEYWORDS:
-        if competitor.lower() in text:
-            detected_competitors.append(competitor)
+    for keyword in competitor_keywords:
+        if keyword.lower() in text:
+            # Get all competitor names associated with this keyword
+            for mapping in competitor_to_sbu.get(keyword, []):
+                detected_competitors.add(mapping['competitor'])
     
-    return ", ".join(detected_competitors) if detected_competitors else ""
+    return ", ".join(sorted(detected_competitors)) if detected_competitors else ""
 
 
-def scrape_news(keywords: List[str], lookback_days: int = LOOKBACK_DAYS) -> List[Dict]:
-    """Scrape news from Google News RSS for given keywords"""
+async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int) -> Dict:
+    """Asynchronously fetch RSS feed for a given keyword"""
+    encoded_keyword = quote(keyword)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+when:{lookback_days}d&hl=en-IN&gl=IN&ceid=IN:en"
+    
+    try:
+        # Use aiohttp to fetch the feed
+        async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            content = await response.text()
+            
+            # Parse with feedparser (it's synchronous but fast)
+            feed = feedparser.parse(content)
+            
+            if feed.bozo and hasattr(feed, 'bozo_exception'):
+                logging.warning(f"Feed parse warning for '{keyword}': {feed.bozo_exception}")
+            
+            return {
+                'keyword': keyword,
+                'feed': feed,
+                'success': True
+            }
+    
+    except Exception as e:
+        logging.error(f"Error fetching feed for '{keyword}': {e}")
+        return {
+            'keyword': keyword,
+            'feed': None,
+            'success': False
+        }
+
+
+async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[str], 
+                            competitor_to_sbu: Dict, lookback_days: int = LOOKBACK_DAYS) -> List[Dict]:
+    """Scrape news asynchronously for all competitor keywords"""
     all_articles = []
     seen_links = set()
     
-    for i, keyword in enumerate(keywords):
-        logging.info(f"Processing keyword {i+1}/{len(keywords)}: {keyword}")
+    # Create aiohttp session
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
+    timeout = aiohttp.ClientTimeout(total=60)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # Create tasks for all keywords
+        tasks = []
+        for keyword in competitor_keywords:
+            task = fetch_feed_async(session, keyword, lookback_days)
+            tasks.append(task)
+            
+            # Add small delay between task creation to avoid overwhelming the server
+            await asyncio.sleep(REQUEST_DELAY / len(competitor_keywords))
         
-        encoded_keyword = quote(keyword)
-        rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+when:{lookback_days}d&hl=en-IN&gl=IN&ceid=IN:en"
-        
-        feed = fetch_feed_safe(rss_url, keyword)
-        if not feed or not feed.entries:
-            logging.warning(f"No results for keyword: {keyword}")
+        # Execute all tasks concurrently with progress tracking
+        logging.info(f"Fetching {len(tasks)} RSS feeds concurrently...")
+        results = await asyncio.gather(*tasks)
+    
+    # Process results
+    successful_fetches = 0
+    for result in results:
+        if not result['success'] or not result['feed'] or not result['feed'].entries:
             continue
+        
+        successful_fetches += 1
+        keyword = result['keyword']
+        feed = result['feed']
         
         for entry in feed.entries:
             title = entry.get("title", "")
@@ -137,7 +188,6 @@ def scrape_news(keywords: List[str], lookback_days: int = LOOKBACK_DAYS) -> List
             # Skip duplicates
             if link in seen_links:
                 continue
-            seen_links.add(link)
             
             # Parse date
             try:
@@ -153,14 +203,17 @@ def scrape_news(keywords: List[str], lookback_days: int = LOOKBACK_DAYS) -> List
                 if font_tag:
                     source = font_tag.text.strip()
             
-            # Verify keyword match
-            text_lower = f"{title} {source}".lower()
-            if keyword.lower() not in text_lower:
+            # Detect competitor (must match to proceed)
+            competitor = detect_competitor(title, source, competitor_to_sbu, competitor_keywords)
+            if not competitor:
                 continue
             
-            # Detect SBU and Competitor
-            sbu = detect_sbu(title, source)
-            competitor = detect_competitor(title, source)
+            # Detect SBU (must match at least one SBU keyword)
+            sbu = detect_sbu(title, source, sbu_keywords)
+            if not sbu:
+                continue  # Skip articles without SBU relevance
+            
+            seen_links.add(link)
             
             all_articles.append({
                 "keyword": keyword,
@@ -170,13 +223,22 @@ def scrape_news(keywords: List[str], lookback_days: int = LOOKBACK_DAYS) -> List
                 "publishedate": pubdate,
                 "sbu": sbu,
                 "competitor": competitor,
-                "scraped_content": ""  # Will be filled by LLM script
+                "scraped_content": ""
             })
-        
-        # Rate limiting
-        time.sleep(random.uniform(DELAY_BETWEEN_REQUESTS, DELAY_BETWEEN_REQUESTS + 1))
+    
+    logging.info(f"Successfully fetched {successful_fetches}/{len(competitor_keywords)} feeds")
+    logging.info(f"Found {len(all_articles)} relevant articles (with competitors AND SBU match)")
     
     return all_articles
+
+
+def get_db_connection():
+    """Get database connection from environment variable"""
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        raise Exception("DATABASE_URL environment variable not set")
+    
+    return psycopg.connect(database_url, row_factory=dict_row)
 
 
 def save_to_database(articles: List[Dict]):
@@ -222,26 +284,43 @@ def save_to_database(articles: List[Dict]):
     logging.info(f"✅ Saved {saved_count} new articles to database")
 
 
-def main():
-    """Main scraping function"""
+async def main_async():
+    """Main async scraping function"""
     logging.info("=" * 60)
-    logging.info("Starting News Scraping Job")
+    logging.info("Starting Competitor News Scraping Job (Async)")
     logging.info("=" * 60)
+    
+    # Load keywords from Excel
+    keywords_data = load_keywords_from_excel()
+    
+    competitor_keywords = keywords_data['competitor_keywords']
+    sbu_keywords = keywords_data['sbu_keywords']
+    competitor_to_sbu = keywords_data['competitor_to_sbu']
+    
+    logging.info(f"Searching for {len(competitor_keywords)} competitor keywords")
+    logging.info(f"Filtering by {len(sbu_keywords)} SBU keywords")
+    logging.info(f"Lookback period: {LOOKBACK_DAYS} days")
     
     # Scrape news
-    articles = scrape_news(CORE_KEYWORDS)
-    logging.info(f"Scraped {len(articles)} unique articles")
-    
-    # Filter for articles with competitors
-    articles_with_competitors = [a for a in articles if a['competitor']]
-    logging.info(f"Found {len(articles_with_competitors)} articles with competitors")
+    articles = await scrape_news_async(
+        competitor_keywords=competitor_keywords,
+        sbu_keywords=sbu_keywords,
+        competitor_to_sbu=competitor_to_sbu,
+        lookback_days=LOOKBACK_DAYS
+    )
     
     # Save to database
-    save_to_database(articles_with_competitors)
+    save_to_database(articles)
     
     logging.info("=" * 60)
     logging.info("Scraping Job Complete")
     logging.info("=" * 60)
+
+
+def main():
+    """Entry point for the scraper"""
+    # Run async main function
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
