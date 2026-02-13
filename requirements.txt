@@ -1,6 +1,7 @@
 feedparser==6.0.11
 beautifulsoup4==4.12.3
 psycopg[binary]==3.2.3
+psycopg[pool]==3.2.3
 anthropic==0.42.0
 requests==2.31.0
 tenacity==9.0.0
