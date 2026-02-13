@@ -1,28 +1,27 @@
-"""
-Production LLM Processing for Competitor Intelligence (Optimized)
-Processes scraped news with Claude API and updates PostgreSQL
-"""
-
 import os
 import logging
 import time
-import asyncio
-from typing import Dict, List, Optional
-import psycopg
-from psycopg.rows import dict_row
-from anthropic import Anthropic
-from anthropic._exceptions import RateLimitError
 import json
 import requests
+import psycopg
+from psycopg.rows import dict_row
+import pandas as pd
+import re
+from dotenv import load_dotenv
+from typing import Dict, List
 from bs4 import BeautifulSoup
+from anthropic import Anthropic
+from anthropic._exceptions import RateLimitError
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from difflib import SequenceMatcher
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
+load_dotenv()
 
 # Configuration
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
@@ -30,309 +29,673 @@ if not CLAUDE_API_KEY:
     raise Exception("CLAUDE_API_KEY environment variable not set")
 
 client = Anthropic(api_key=CLAUDE_API_KEY)
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Model
+CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+
+# Excel mapping file
+EXCEL_MAPPING_FILE = "SBU_Competitor_Mapping.xlsx"
 
 # Performance Configuration
-BATCH_SIZE = 50  # Process articles in batches for better database performance
-MAX_WORKERS = 5  # Parallel web scraping threads
-PROCESS_LIMIT = 500  # Maximum articles to process per run
-RATE_LIMIT_DELAY = 0.5  # Reduced from 1 second
+STAGE1_BATCH_SIZE = 50
+STAGE2_BATCH_SIZE = 20
+MAX_WORKERS = 15
+RATE_LIMIT_DELAY = 0.15
 
-# Combined prompt for efficiency - single API call instead of two
-COMBINED_ANALYSIS_PROMPT = """You are a senior business analyst for KEC International Ltd evaluating news relevance.
+# Relevance threshold
+RELEVANCE_THRESHOLD = 70
 
-KEC International operates in: India T&D, International T&D, Transportation (Rail/Metro), Civil (Infrastructure), Renewables (Solar/Wind), Oil & Gas (Pipelines).
-
-Key Competitors: L&T, Kalpataru, Sterlite Power, Tata Projects, NCC, Siemens, ABB, Hitachi Energy, IRCON, RVNL.
-
-Analyze this article and provide:
-
-RELEVANCE SCORE (0-100):
-90-100: Direct impact - contracts, orders, tenders, major projects
-70-89: Strong sector news - policy, technology, market trends
-30-69: Indirect relevance - adjacent infrastructure
-1-29: Weak link - generic news
-0: Not relevant
-
-CONFIDENCE SCORE (0-100):
-80-100: High confidence - detailed, explicit information
-40-79: Medium confidence - some ambiguity
-0-39: Low confidence - vague information
-
-SBUs: India T&D, International T&D, Transportation, Civil, Renewables, Oil & Gas, General
-Categories: order wins, new market entry, mergers & acquisitions, partnerships & alliances, financial, stock market, leadership/management, industry
-
-Return ONLY valid JSON:
-{
-  "relevance_score": <int>,
-  "confidence_score": <int>,
-  "sbu_tagging": "<comma-separated SBUs>",
-  "category_tag": "<single category>",
-  "kec_business_summary": "<2-3 sentence summary>"
-}"""
-
+# ============================================================================
+# DATABASE FUNCTIONS
+# ============================================================================
 
 def get_db_connection():
-    """Get database connection"""
+    """Get database connection from environment variable"""
     database_url = os.environ.get('DATABASE_URL')
     if not database_url:
         raise Exception("DATABASE_URL environment variable not set")
+    
     return psycopg.connect(database_url, row_factory=dict_row)
+
+
+def load_raw_articles() -> pd.DataFrame:
+    """Load unprocessed articles from raw_scraped_articles table"""
+    conn = get_db_connection()
+    
+    query = """
+        SELECT 
+            id,
+            published_date,
+            news_title,
+            competitor,
+            sbu,
+            source,
+            search_keyword,
+            link,
+            content
+        FROM raw_scraped_articles
+        ORDER BY published_date DESC
+    """
+    
+    cur = conn.cursor()
+    cur.execute(query)
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not results:
+        return pd.DataFrame()
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results)
+    
+    # Rename columns to match expected format
+    df = df.rename(columns={
+        'news_title': 'News Title',
+        'link': 'Link',
+        'competitor': 'Competitor',
+        'sbu': 'SBU',
+        'source': 'Source',
+        'published_date': 'Published Date'
+    })
+    
+    return df
+
+
+def save_to_processed_articles(df: pd.DataFrame):
+    """Save processed articles to processed_articles table"""
+    if df.empty:
+        logging.info("No articles to save")
+        return
+    
+    conn = get_db_connection()
+    
+    insert_query = """
+        INSERT INTO processed_articles (
+            published_date,
+            news_title,
+            link,
+            relevance_score,
+            competitor_tagging,
+            sbu_tagging,
+            category_tag,
+            summary,
+            scraped_content
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (link, published_date) DO NOTHING
+    """
+    
+    saved_count = 0
+    failed_count = 0
+    
+    for idx, row in df.iterrows():
+        try:
+            cur = conn.cursor()
+            cur.execute(insert_query, (
+                row.get('Published Date'),
+                row.get('News Title'),
+                row.get('Link'),
+                row.get('relevance_score', 0),
+                row.get('competitor_tagging', '-'),
+                row.get('sbu_tagging', 'None'),
+                row.get('category_tag', 'not_analyzed'),
+                row.get('summary', ''),
+                row.get('scraped_content', '')
+            ))
+            conn.commit()
+            cur.close()
+            saved_count += 1
+        except Exception as e:
+            conn.rollback()
+            failed_count += 1
+            logging.error(f"Error saving article '{row.get('News Title', 'Unknown')[:50]}...': {e}")
+    
+    conn.close()
+    
+    logging.info(f"✅ Saved {saved_count} articles to processed_articles table")
+    if failed_count > 0:
+        logging.warning(f"⚠️  Failed to save {failed_count} articles")
+
+
+def clear_raw_articles():
+    """Clear all records from raw_scraped_articles table"""
+    conn = get_db_connection()
+    
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM raw_scraped_articles")
+        deleted_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        logging.info(f"🗑️  Cleared {deleted_count} articles from raw_scraped_articles table")
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        logging.error(f"Error clearing raw_scraped_articles: {e}")
+
+
+# ============================================================================
+# LOAD DATA FROM EXCEL
+# ============================================================================
+
+def load_excel_data():
+    """Load competitors, SBUs, and categories from Excel file"""
+    
+    if not os.path.exists(EXCEL_MAPPING_FILE):
+        raise FileNotFoundError(f"❌ {EXCEL_MAPPING_FILE} not found! Please ensure it's in the same directory.")
+    
+    logging.info(f"📂 Loading data from {EXCEL_MAPPING_FILE}...")
+    
+    # Read Competitor sheet
+    competitor_df = pd.read_excel(EXCEL_MAPPING_FILE, sheet_name='Competitor', header=1)
+    competitors_list = competitor_df['Competitor'].dropna().unique().tolist()
+    
+    # Read SBU sheet
+    sbu_df = pd.read_excel(EXCEL_MAPPING_FILE, sheet_name='SBU', header=1)
+    sbu_list = sbu_df['SBU'].dropna().unique().tolist()
+    
+    # Read Categories sheet
+    categories_df = pd.read_excel(EXCEL_MAPPING_FILE, sheet_name='Categories')
+    categories_list = categories_df['Category'].dropna().tolist()
+    
+    logging.info(f"   ✅ Loaded {len(competitors_list)} competitors")
+    logging.info(f"   ✅ Loaded {len(sbu_list)} SBUs")
+    logging.info(f"   ✅ Loaded {len(categories_list)} categories")
+    
+    return {
+        'competitors': competitors_list,
+        'sbus': sbu_list,
+        'categories': categories_list
+    }
+
+
+# ============================================================================
+# BUILD DYNAMIC PROMPT
+# ============================================================================
+
+def build_full_analysis_prompt(competitors: List[str], categories: List[str]) -> str:
+    """Build the full analysis prompt with dynamic data"""
+    
+    # Format competitors list
+    competitors_text = "\n".join([f"- {comp}" for comp in competitors])
+    
+    # Format categories list with numbering
+    categories_text = "\n".join([f"{i+1}. **{cat}**" for i, cat in enumerate(categories)])
+    
+    prompt = f"""You are a business intelligence analyst for KEC International analyzing competitor news articles.
+
+====================
+ABOUT KEC INTERNATIONAL
+====================
+KEC International is a global infrastructure EPC major with 80+ years of experience, executing large-scale projects across 110+ countries.
+KEC operates through six main business verticals (SBUs):
+
+**1. TRANSMISSION & DISTRIBUTION (T&D)**
+   - INDIA T&D: Power transmission lines, substations, grid infrastructure within India
+   - INTERNATIONAL T&D: Power transmission projects outside India
+
+**2. TRANSPORTATION**
+   - Railways: Overhead electrification (OHE), signaling systems
+   - Urban Infrastructure: Metro rail projects
+
+**3. CIVIL**
+   - Buildings, industrial facilities, water treatment plants
+
+**4. RENEWABLES**
+   - Solar and wind power projects
+
+**5. OIL & GAS PIPELINES**
+   - Cross-country pipelines
+
+**6. CABLES & CONDUCTORS** (Manufacturing)
+
+====================
+COMPETITORS LIST
+====================
+Use ONLY these competitor names from our database:
+
+{competitors_text}
+
+====================
+CATEGORIES
+====================
+Classify into ONE category:
+
+{categories_text}
+
+====================
+YOUR TASK
+====================
+Analyze the following article and extract four fields:
+
+**1. COMPETITOR TAGGING**
+- Identify ALL competitors mentioned doing KEC-relevant business
+- ONLY use names from COMPETITORS LIST above
+- If multiple, separate with commas: "L&T, Tata Projects"
+- If NO competitor found, output "-"
+
+**2. SBU TAGGING**
+- Identify which of KEC's SBUs this is relevant to
+- Use exact names: "India T&D", "International T&D", "Transportation", "Civil", "Renewables", "Oil & Gas"
+- Most articles = ONE SBU only
+- If truly none match, use "General"
+
+**3. CATEGORY TAG**
+- Classify into ONE category from list above
+
+**4. SUMMARY**
+- Write 2-3 sentences ONLY
+- Include: WHO (competitor), WHAT (action), WHERE (location), VALUE (if mentioned)
+- Focus on competitive impact to KEC
+
+====================
+OUTPUT FORMAT
+====================
+Return ONLY valid JSON:
+
+{{
+  "competitor_tagging": "<comma-separated or '-'>",
+  "sbu_tagging": "<comma-separated or 'General'>",
+  "category_tag": "<single category>",
+  "summary": "<2-3 sentences>"
+}}"""
+
+    return prompt
+
+
+# ============================================================================
+# STAGE 1: QUICK RELEVANCE SCORING
+# ============================================================================
+
+QUICK_SCORE_PROMPT = """You are an expert relevance scorer for KEC International's competitive intelligence system.
+
+KEC'S CORE BUSINESSES:
+- Transmission & Distribution (T&D)
+- Transportation (Railways, Metro)
+- Civil (Buildings, Infrastructure)
+- Renewables (Solar, Wind)
+- Oil & Gas Pipelines
+
+SCORING RULES (0-100):
+
+85-100: MUST ANALYZE
+- Competitor wins major EPC contract (₹500+ crore)
+- Major M&A/JV in infrastructure
+- Government policy/budget for T&D/Rail/Renewables
+
+70-84: TANGENTIALLY USEFUL
+- Quarterly results mentioning order book
+- Industry sector commentary
+
+20-39: WEAK RELEVANCE
+- Stock price movements only
+- Generic CSR announcements
+
+0-19: IRRELEVANT
+- Unrelated businesses (IT, FMCG, retail)
+- Generic market news
+
+Return ONLY an integer 0-100. No explanation."""
 
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
-    stop=stop_after_attempt(3),  # Reduced from 5
+    stop=stop_after_attempt(3),
     retry=retry_if_exception_type(RateLimitError),
     reraise=True
 )
-def call_claude(prompt: str, system_prompt: str, max_tokens: int = 500) -> str:
-    """Call Claude API with retry logic"""
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        temperature=0,
-        system=system_prompt,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.content[0].text
+def quick_relevance_score(title: str, competitor: str) -> int:
+    """Quick relevance scoring using title only"""
+    
+    prompt = f"""Title: {title}
+Competitor: {competitor}
+
+Relevance score (0-100):"""
+    
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=10,
+            temperature=0,
+            system=QUICK_SCORE_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        score_text = response.content[0].text.strip()
+        score = int(re.search(r'\d+', score_text).group())
+        return max(0, min(100, score))
+        
+    except Exception as e:
+        logging.warning(f"Quick score failed for '{title[:50]}...': {e}")
+        return 0
 
 
-def scrape_article_content(url: str, max_length: int = 3000) -> str:
-    """Scrape article content from URL (reduced from 5000)"""
+# ============================================================================
+# STAGE 2: FULL ANALYSIS
+# ============================================================================
+
+def scrape_article(url: str, max_length: int = 3000) -> str:
+    """Scrape article content"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=8)  # Reduced timeout
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "aside", "header"]):
-            script.decompose()
+        # Remove unwanted elements
+        for element in soup(["script", "style", "nav", "footer", "aside", "header", "iframe"]):
+            element.decompose()
         
-        # Get text
-        text = soup.get_text(separator=' ', strip=True)
+        # Extract text
+        text = ' '.join(soup.get_text(separator=' ', strip=True).split())
         
-        # Clean and truncate
-        text = ' '.join(text.split())
-        return text[:max_length]
-    
+        return text[:max_length] if text else ""
+        
     except Exception as e:
-        logging.debug(f"Failed to scrape {url}: {e}")
+        logging.warning(f"Scraping failed for {url}: {e}")
         return ""
 
 
-def scrape_articles_parallel(articles: List[Dict]) -> Dict[int, str]:
-    """Scrape multiple articles in parallel"""
-    content_map = {}
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RateLimitError),
+    reraise=True
+)
+def full_analysis(title: str, content: str, relevance_score: int, full_prompt: str) -> Dict:
+    """Full analysis with scraped content"""
     
-    def scrape_single(article):
-        article_id = article['id']
-        content = article.get('scraped_content', '')
-        if not content:
-            content = scrape_article_content(article['link'])
-        if not content:
-            content = article['newstitle']  # Fallback to title
-        return article_id, content
+    # Use content if available, otherwise fall back to title
+    analysis_text = content[:2000] if content else title
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scrape_single, article): article for article in articles}
-        
-        for future in as_completed(futures):
-            try:
-                article_id, content = future.result()
-                content_map[article_id] = content
-            except Exception as e:
-                article = futures[future]
-                logging.warning(f"Scraping failed for article {article['id']}: {e}")
-                content_map[article['id']] = article['newstitle']
-    
-    return content_map
+    prompt = f"""Analyze this news (relevance score: {relevance_score}/100):
 
+Title: {title}
+Content: {analysis_text}
 
-def process_article_combined(title: str, content: str) -> Dict:
-    """Process article with single Claude API call (more efficient)"""
-    prompt = f"News Title: {title}\n\nContent: {content[:2500]}"
+Provide detailed analysis."""
     
     try:
-        response = call_claude(prompt, COMBINED_ANALYSIS_PROMPT, max_tokens=500)
-        result = json.loads(response)
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=500,
+            temperature=0,
+            system=full_prompt,
+            messages=[{"role": "user", "content": prompt}]
+        )
         
-        return {
-            'relevance_score': result.get('relevance_score', 0),
-            'confidance_score': result.get('confidence_score', 0),  # Keeping typo for DB consistency
-            'sbu_tagging': result.get('sbu_tagging', ''),
-            'category_tag': result.get('category_tag', 'industry'),
-            'kec_business_summary': result.get('kec_business_summary', title)
-        }
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON parse error: {e}, Response: {response[:200]}")
-        return {
-            'relevance_score': 0,
-            'confidance_score': 0,
-            'sbu_tagging': '',
-            'category_tag': 'industry',
-            'kec_business_summary': title
-        }
-    except Exception as e:
-        logging.error(f"Processing failed: {e}")
-        return {
-            'relevance_score': 0,
-            'confidance_score': 0,
-            'sbu_tagging': '',
-            'category_tag': 'industry',
-            'kec_business_summary': title
-        }
-
-
-def get_unprocessed_articles(limit: int = PROCESS_LIMIT) -> List[Dict]:
-    """Get articles that haven't been processed by LLM yet"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    query = """
-        SELECT id, newstitle, link, scraped_content
-        FROM competitor_data
-        WHERE (relevance_score IS NULL OR relevance_score = 0)
-        AND competitor IS NOT NULL
-        AND competitor != ''
-        ORDER BY publishedate DESC
-        LIMIT %s
-    """
-    
-    cur.execute(query, (limit,))
-    articles = cur.fetchall()
-    
-    cur.close()
-    conn.close()
-    
-    return articles
-
-
-def update_articles_batch(updates_list: List[tuple]):
-    """Update multiple articles in a single transaction (much faster)"""
-    if not updates_list:
-        return
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    update_query = """
-        UPDATE competitor_data
-        SET 
-            scraped_content = %s,
-            relevance_score = %s,
-            confidance_score = %s,
-            sbu_tagging = %s,
-            category_tag = %s,
-            kec_business_summary = %s,
-            matched_sbu = %s
-        WHERE id = %s
-    """
-    
-    try:
-        # Execute all updates in one transaction
-        cur.executemany(update_query, updates_list)
-        conn.commit()
-        logging.info(f"✅ Batch updated {len(updates_list)} articles")
-    except Exception as e:
-        logging.error(f"Batch update failed: {e}")
-        conn.rollback()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def process_batch(articles: List[Dict], content_map: Dict[int, str]) -> List[tuple]:
-    """Process a batch of articles and return updates"""
-    updates_list = []
-    
-    for article in articles:
-        article_id = article['id']
-        title = article['newstitle']
-        content = content_map.get(article_id, title)
+        raw_response = response.content[0].text.strip()
         
-        try:
-            # Single API call for all analysis
-            result = process_article_combined(title, content)
+        # Extract JSON
+        raw_response = re.sub(r'^```json\s*', '', raw_response)
+        raw_response = re.sub(r'^```\s*', '', raw_response)
+        raw_response = re.sub(r'\s*```$', '', raw_response)
+        
+        json_match = re.search(r'\{[\s\S]*\}', raw_response)
+        
+        if json_match:
+            analysis = json.loads(json_match.group(0))
+        else:
+            raise ValueError("No JSON found")
+        
+        # Add relevance score from Stage 1
+        analysis['relevance_score'] = relevance_score
+        
+        # Validate
+        required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary"]
+        for field in required:
+            if field not in analysis:
+                raise ValueError(f"Missing field: {field}")
+        
+        return analysis
+        
+    except Exception as e:
+        logging.error(f"Full analysis failed for '{title[:50]}...': {e}")
+        return {
+            "relevance_score": relevance_score,
+            "competitor_tagging": "-",
+            "sbu_tagging": "None",
+            "category_tag": "error",
+            "summary": f"Analysis error: {str(e)[:100]}"
+        }
+
+
+# ============================================================================
+# PIPELINE PROCESSING
+# ============================================================================
+
+def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
+    """Stage 1: Quick relevance scoring for all articles"""
+    
+    logging.info("\n" + "="*60)
+    logging.info("STAGE 1: QUICK RELEVANCE SCORING (Title Only)")
+    logging.info("="*60)
+    
+    relevance_scores = []
+    total = len(df)
+    
+    for i in range(0, total, STAGE1_BATCH_SIZE):
+        batch_num = i // STAGE1_BATCH_SIZE + 1
+        total_batches = (total + STAGE1_BATCH_SIZE - 1) // STAGE1_BATCH_SIZE
+        
+        batch_df = df.iloc[i:i+STAGE1_BATCH_SIZE]
+        
+        logging.info(f"\n📊 Scoring batch {batch_num}/{total_batches} ({len(batch_df)} articles)...")
+        
+        for idx, row in batch_df.iterrows():
+            title = str(row['News Title'])
+            competitor = str(row.get('Competitor', ''))
             
-            # Prepare update tuple
-            updates_list.append((
-                content,
-                result['relevance_score'],
-                result['confidance_score'],
-                result['sbu_tagging'],
-                result['category_tag'],
-                result['kec_business_summary'],
-                result['sbu_tagging'],  # matched_sbu same as sbu_tagging
-                article_id
-            ))
+            score = quick_relevance_score(title, competitor)
+            relevance_scores.append(score)
             
-            # Rate limiting
+            if score >= RELEVANCE_THRESHOLD:
+                logging.info(f"   ✅ Score {score}: {title[:60]}...")
+            
             time.sleep(RATE_LIMIT_DELAY)
-            
-        except Exception as e:
-            logging.error(f"Failed to process article {article_id}: {e}")
-            # Add failed article with default values
-            updates_list.append((
-                content,
-                0, 0, '', 'industry', title, '', article_id
-            ))
     
-    return updates_list
+    df['relevance_score'] = relevance_scores
+    
+    high_relevance = df[df['relevance_score'] >= RELEVANCE_THRESHOLD]
+    
+    logging.info(f"\n📈 Stage 1 Complete:")
+    logging.info(f"   Total articles: {len(df)}")
+    logging.info(f"   High relevance (≥{RELEVANCE_THRESHOLD}): {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
+    
+    return df
 
+
+def stage2_full_analysis(df: pd.DataFrame, full_prompt: str) -> pd.DataFrame:
+    """Stage 2: Full analysis only for high-relevance articles"""
+    
+    logging.info("\n" + "="*60)
+    logging.info("STAGE 2: FULL ANALYSIS (Scraping + Deep Analysis)")
+    logging.info("="*60)
+    
+    # Filter for high relevance
+    high_rel_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
+    
+    if len(high_rel_df) == 0:
+        logging.warning("No articles meet relevance threshold. Skipping Stage 2.")
+        return df
+    
+    # Initialize columns for all rows
+    df['competitor_tagging'] = '-'
+    df['sbu_tagging'] = 'None'
+    df['category_tag'] = 'not_analyzed'
+    df['summary'] = 'Not analyzed (low relevance)'
+    df['scraped_content'] = ''
+    
+    total = len(high_rel_df)
+    
+    for i in range(0, total, STAGE2_BATCH_SIZE):
+        batch_num = i // STAGE2_BATCH_SIZE + 1
+        total_batches = (total + STAGE2_BATCH_SIZE - 1) // STAGE2_BATCH_SIZE
+        
+        batch_df = high_rel_df.iloc[i:i+STAGE2_BATCH_SIZE]
+        
+        logging.info(f"\n🔍 Analyzing batch {batch_num}/{total_batches} ({len(batch_df)} articles)...")
+        
+        # Parallel scraping
+        logging.info(f"   📥 Scraping {len(batch_df)} articles...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_idx = {
+                executor.submit(scrape_article, row['Link']): idx
+                for idx, row in batch_df.iterrows()
+            }
+            
+            contents = {}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                contents[idx] = future.result()
+        
+        # Sequential analysis
+        logging.info(f"   🤖 Running full analysis...")
+        for idx, row in batch_df.iterrows():
+            title = str(row['News Title'])
+            content = contents.get(idx, '')
+            relevance = row['relevance_score']
+            
+            analysis = full_analysis(title, content, relevance, full_prompt)
+            
+            # Update dataframe
+            df.at[idx, 'competitor_tagging'] = analysis['competitor_tagging']
+            df.at[idx, 'sbu_tagging'] = analysis['sbu_tagging']
+            df.at[idx, 'category_tag'] = analysis['category_tag']
+            df.at[idx, 'summary'] = analysis['summary']
+            df.at[idx, 'scraped_content'] = content[:500] if content else ''
+            
+            time.sleep(RATE_LIMIT_DELAY)
+    
+    logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
+    
+    return df
+
+
+def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
+    """Fast deduplication based on title similarity"""
+    
+    logging.info("\n🔍 Deduplicating articles...")
+    
+    df_reset = df.reset_index(drop=True)
+    to_drop = set()
+    
+    for i in range(len(df_reset)):
+        if i in to_drop:
+            continue
+        
+        title_i = str(df_reset.iloc[i]['News Title']).lower()
+        
+        for j in range(i + 1, min(i + 50, len(df_reset))):
+            if j in to_drop:
+                continue
+            
+            title_j = str(df_reset.iloc[j]['News Title']).lower()
+            similarity = SequenceMatcher(None, title_i, title_j).ratio()
+            
+            if similarity > 0.85:
+                to_drop.add(j)
+    
+    logging.info(f"   🗑️ Removed {len(to_drop)} duplicates")
+    
+    return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
 
 def main():
-    """Main LLM processing function"""
-    logging.info("=" * 60)
-    logging.info("Starting Optimized LLM Processing Job")
-    logging.info("=" * 60)
+    """Main execution pipeline"""
     
-    # Get unprocessed articles
-    articles = get_unprocessed_articles()
-    total_articles = len(articles)
-    logging.info(f"Found {total_articles} articles to process")
+    start_time = time.time()
     
-    if not articles:
-        logging.info("No articles to process. Exiting.")
+    logging.info("="*60)
+    logging.info("KEC INTERNATIONAL - COMPETITIVE INTELLIGENCE ANALYZER")
+    logging.info("="*60)
+    
+    # Load raw articles from database
+    logging.info("📥 Loading articles from raw_scraped_articles table...")
+    df = load_raw_articles()
+    
+    if df.empty:
+        logging.info("ℹ️  No articles to process. Exiting.")
         return
     
-    # Process in batches
-    all_updates = []
+    logging.info(f"📄 Loaded {len(df)} articles")
     
-    for batch_num in range(0, total_articles, BATCH_SIZE):
-        batch = articles[batch_num:batch_num + BATCH_SIZE]
-        batch_size = len(batch)
-        
-        logging.info(f"\n--- Processing Batch {batch_num//BATCH_SIZE + 1} ({batch_size} articles) ---")
-        
-        # Step 1: Scrape all articles in parallel
-        logging.info("Scraping article content in parallel...")
-        content_map = scrape_articles_parallel(batch)
-        
-        # Step 2: Process with Claude (sequential for rate limiting)
-        logging.info("Processing with Claude API...")
-        batch_updates = process_batch(batch, content_map)
-        
-        # Step 3: Batch update database
-        update_articles_batch(batch_updates)
-        
-        all_updates.extend(batch_updates)
-        
-        logging.info(f"Batch complete: {len(batch_updates)}/{batch_size} processed")
+    # Deduplicate first (within current batch)
+    df = deduplicate_articles(df)
+    logging.info(f"📄 After deduplication: {len(df)} articles")
     
-    # Summary
-    successful = len([u for u in all_updates if u[1] > 0])  # relevance_score > 0
+    # Load Excel mapping data
+    try:
+        excel_data = load_excel_data()
+    except Exception as e:
+        logging.error(f"❌ Failed to load Excel data: {e}")
+        return
     
-    logging.info("=" * 60)
-    logging.info(f"LLM Processing Complete")
-    logging.info(f"Total Processed: {len(all_updates)}/{total_articles}")
-    logging.info(f"Successfully Analyzed: {successful}")
-    logging.info(f"Failed/Skipped: {len(all_updates) - successful}")
-    logging.info("=" * 60)
+    # Build dynamic prompt
+    logging.info("\n🔧 Building analysis prompt...")
+    full_prompt = build_full_analysis_prompt(
+        competitors=excel_data['competitors'],
+        categories=excel_data['categories']
+    )
+    
+    # Stage 1: Quick scoring
+    df = stage1_quick_scoring(df)
+    
+    # Stage 2: Full analysis (only high-relevance)
+    df = stage2_full_analysis(df, full_prompt)
+    
+    # Save to processed_articles table
+    logging.info("\n💾 Saving to processed_articles table...")
+    save_to_processed_articles(df)
+    
+    # Clear raw_scraped_articles table
+    logging.info("\n🧹 Clearing raw_scraped_articles table...")
+    clear_raw_articles()
+    
+    # Statistics
+    elapsed = time.time() - start_time
+    high_relevance = df[df['relevance_score'] >= RELEVANCE_THRESHOLD]
+    
+    logging.info("\n" + "="*60)
+    logging.info("📈 PROCESSING COMPLETE")
+    logging.info("="*60)
+    logging.info(f"⏱️  Time: {elapsed/60:.1f} minutes")
+    logging.info(f"📄 Total articles processed: {len(df)}")
+    logging.info(f"⭐ High relevance: {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
+    
+    if len(high_relevance) > 0:
+        logging.info(f"\n📊 Top Categories:")
+        for cat, count in high_relevance['category_tag'].value_counts().head(5).items():
+            logging.info(f"   {cat}: {count}")
+        
+        logging.info(f"\n📁 Top SBUs:")
+        for sbu, count in high_relevance['sbu_tagging'].value_counts().head(5).items():
+            logging.info(f"   {sbu}: {count}")
+    
+    # Cost estimate
+    stage1_calls = len(df)
+    stage2_calls = len(high_relevance)
+    total_calls = stage1_calls + stage2_calls
+    est_tokens = (stage1_calls * 200) + (stage2_calls * 3000)
+    est_cost = (est_tokens / 1_000_000) * 3.00
+    
+    logging.info(f"\n💰 API Usage:")
+    logging.info(f"   Stage 1 calls: {stage1_calls}")
+    logging.info(f"   Stage 2 calls: {stage2_calls}")
+    logging.info(f"   Total calls: {total_calls}")
+    logging.info(f"   Est. cost: ~${est_cost:.2f}")
+    logging.info("="*60)
 
 
 if __name__ == "__main__":
