@@ -1,24 +1,13 @@
-# Core web framework (for API server - main.py)
 fastapi==0.109.0
-uvicorn[standard]==0.27.0
-
-# Database - Use psycopg-binary instead of psycopg[binary]
-psycopg-binary==3.2.3
-
-# Web scraping
+uvicorn==0.27.0
+psycopg2-binary==2.9.9
 aiohttp==3.9.3
 feedparser==6.0.11
 beautifulsoup4==4.12.3
 lxml==5.1.0
 requests==2.31.0
-
-# LLM processing
 anthropic==0.42.0
 tenacity==9.0.0
-
-# Data processing
 pandas==2.2.0
 openpyxl==3.1.2
-
-# Environment variables
 python-dotenv==1.0.0
