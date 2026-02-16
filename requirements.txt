@@ -2,9 +2,8 @@
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 
-# Database - PostgreSQL v3
-psycopg[binary]==3.2.3
-psycopg[pool]==3.2.3
+# Database - Use psycopg-binary instead of psycopg[binary]
+psycopg-binary==3.2.3
 
 # Web scraping
 aiohttp==3.9.3
