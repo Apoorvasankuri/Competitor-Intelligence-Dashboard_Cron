@@ -59,7 +59,6 @@ def load_keywords_from_excel():
     competitor_to_sbu = {}
     
     for idx, row in competitor_df.iterrows():
-        sbu = row['SBU']
         competitor = row['Competitor']
         keywords_raw = row['Competitor Key Words']
         
@@ -73,7 +72,7 @@ def load_keywords_from_excel():
                 if keyword not in competitor_to_sbu:
                     competitor_to_sbu[keyword] = []
                 competitor_to_sbu[keyword].append({
-                    'sbu': sbu,
+                    'sbu': 'General',
                     'competitor': competitor
                 })
     
