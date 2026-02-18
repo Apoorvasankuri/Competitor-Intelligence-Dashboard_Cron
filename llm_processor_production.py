@@ -381,18 +381,29 @@ RULES:
 
 **4. SUMMARY**
 RULES:
-- Write 2-3 sentences ONLY
-- Focus on competitive impact to KEC (what does this mean for KEC's business?)
-- Include: WHO (competitor), WHAT (action/project), WHERE (location/geography), VALUE (contract value if mentioned)
-- Highlight strategic implications (market share, new geography, technology advantage)
-- Be specific with numbers and locations
+- Write EXACTLY 1-2 sentences (maximum 40 words total)
+- Be crisp and fact-dense - every word must add value
+- MUST include: Competitor name, key numbers (contract value/revenue/percentage), specific action related to category
+- Structure: "[Competitor] [action verb] [key number] [what/where] [category-specific detail]"
+- NO generic phrases like "strengthening position" or "demonstrates dominance"
+- Focus on FACTS, not implications
 
-GOOD SUMMARY EXAMPLE:
-"L&T secured a ₹850 crore contract for 220 kV transmission line and substation work in Uttar Pradesh, strengthening its position in India's grid expansion market where KEC also competes. This win demonstrates L&T's continued dominance in state utility projects, a key segment for KEC's India T&D business."
+GOOD SUMMARY EXAMPLES:
+✓ "L&T secured ₹850 crore contract for 220 kV transmission line in Uttar Pradesh, including 45 km overhead lines and 2 substations." (ORDER WIN - 24 words)
+✓ "Kalpataru's Q4 revenue grew 22% to ₹4,200 crore with order book at ₹28,000 crore in T&D and urban infrastructure." (FINANCIAL - 22 words)
+✓ "L&T, Tata Projects, Kalpataru, and Sterlite bid for PGCIL's ₹600 crore 400 kV Bikaner-Merta transmission project." (BIDDING - 17 words)
 
-BAD SUMMARY EXAMPLE:
-"The company won a project. This is good for them." (too vague, no specific details)
+BAD SUMMARY EXAMPLES:
+✗ "L&T secured a major contract, strengthening its position in India's grid expansion market where KEC also competes. This win demonstrates L&T's continued dominance in state utility projects." (too wordy, no specific details, 30 words)
+✗ "The company won a project. This is good for them." (too vague, 9 words)
+✗ "Kalpataru Power Transmission achieved impressive growth in the latest quarter, demonstrating strong operational efficiency and market traction across various business segments in competitive markets." (too generic, no numbers, 27 words)
 
+CATEGORY-SPECIFIC REQUIREMENTS:
+- ORDER WINS: Include contract value, scope (km/MW/stations), location
+- FINANCIAL: Include revenue/profit figures, growth %, order book value
+- BIDDING: List all competitors bidding, project value, scope
+- PROJECT EXECUTION: Include capacity/scale, timeline, location
+- M&A/PARTNERSHIPS: Include deal value, stake %, target company details
 ====================
 OUTPUT FORMAT
 ====================
