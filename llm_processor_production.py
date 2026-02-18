@@ -662,11 +662,18 @@ Provide detailed analysis."""
         analysis['relevance_score'] = relevance_score
         
         # Validate
-        required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary"]
+        required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary", "contract_value_inr_crore", "geography"]
         for field in required:
             if field not in analysis:
                 raise ValueError(f"Missing field: {field}")
-        
+
+        # Ensure numeric fields are properly typed
+        if analysis.get('contract_value_inr_crore') is not None:
+            try:
+                analysis['contract_value_inr_crore'] = float(analysis['contract_value_inr_crore'])
+            except:
+                analysis['contract_value_inr_crore'] = None
+
         return analysis
         
     except Exception as e:
@@ -726,7 +733,7 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def stage2_full_analysis(df: pd.DataFrame, full_prompt: str) -> pd.DataFrame:
+def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map: Dict[str, int]) -> pd.DataFrame:
     """Stage 2: Full analysis only for high-relevance articles"""
     
     logging.info("\n" + "="*60)
@@ -776,22 +783,23 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str) -> pd.DataFrame:
             title = str(row['News Title'])
             content = contents.get(idx, '')
             relevance = row['relevance_score']
-            
+    
             analysis = full_analysis(title, content, relevance, full_prompt)
-            
-            # Update dataframe
+    
+            # Update dataframe with analysis results
             df.at[idx, 'competitor_tagging'] = analysis['competitor_tagging']
             df.at[idx, 'sbu_tagging'] = analysis['sbu_tagging']
             df.at[idx, 'category_tag'] = analysis['category_tag']
             df.at[idx, 'summary'] = analysis['summary']
             df.at[idx, 'scraped_content'] = content[:500] if content else ''
-            
+            df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
+            df.at[idx, 'geography'] = analysis.get('geography')
+    
             time.sleep(RATE_LIMIT_DELAY)
-    
-    logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
-    
-    return df
 
+        logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
+
+        return df
 
 def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
     """Fast deduplication based on title similarity"""
@@ -821,6 +829,137 @@ def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
     
     return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
 
+
+# ADD THIS NEW FUNCTION HERE (after line 826)
+def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) -> Dict:
+    """
+    Calculate ranking score for an article
+    
+    Formula:
+    Rank Score = (Category × 50) + (Relevance) + (Competitor Tier × 10) + (Geography × 5) + (Value Tier × 5)
+    
+    Returns dict with rank_score and component breakdowns
+    """
+    
+    # 1. CATEGORY WEIGHT (0-3) × 50 = 0-150 points
+    category = str(row.get('category_tag', '')).lower()
+    
+    category_weights = {
+        'order wins': 3,
+        'bidding activity': 3,
+        'mergers & acquisitions': 2,
+        'partnerships & alliances': 2,
+        'project execution': 2,
+        'financial': 1,
+        'stock market': 1,
+    }
+    
+    category_weight = category_weights.get(category, 0)
+    category_points = category_weight * 50
+    
+    # 2. RELEVANCE SCORE (70-100) = 70-100 points
+    relevance_points = int(row.get('relevance_score', 70))
+    
+    # 3. COMPETITOR TIER (1-3) × 10 = 10-30 points
+    competitor_tagging = str(row.get('competitor_tagging', '-'))
+    competitors = [c.strip() for c in competitor_tagging.split(',') if c.strip() != '-']
+    
+    # Get highest tier (Tier 1 is best, so lowest number)
+    competitor_tier = 3  # Default to lowest tier
+    for comp in competitors:
+        tier = competitor_tier_map.get(comp, 3)
+        if tier < competitor_tier:
+            competitor_tier = tier
+    
+    # Invert: Tier 1 = 3 points, Tier 2 = 2 points, Tier 3 = 1 point
+    competitor_tier_inverted = 4 - competitor_tier
+    competitor_points = competitor_tier_inverted * 10
+    
+    # 4. GEOGRAPHY BONUS (0-2) × 5 = 0-10 points
+    geography = str(row.get('geography', '')).lower() if pd.notna(row.get('geography')) else ''
+    sbu = str(row.get('sbu_tagging', '')).lower()
+    
+    geography_bonus = 0
+    
+    if 'international t&d' in sbu:
+        if any(region in geography for region in ['middle east', 'uae', 'saudi', 'qatar', 'bahrain', 'oman', 'kuwait']):
+            geography_bonus = 2
+        elif any(region in geography for region in ['africa', 'americas', 'saarc']):
+            geography_bonus = 1
+    elif any(s in sbu for s in ['india t&d', 'transportation', 'civil', 'renewables']):
+        if 'india' in geography:
+            geography_bonus = 2
+    elif 'oil & gas' in sbu or 'oil and gas' in sbu:
+        if 'india' in geography or 'middle east' in geography:
+            geography_bonus = 2
+    
+    geography_points = geography_bonus * 5
+    
+    # 5. VALUE TIER (0-4) × 5 = 0-20 points
+    contract_value = row.get('contract_value_inr_crore')
+    
+    value_tier = 0
+    
+    if pd.notna(contract_value) and contract_value > 0:
+        if category in ['order wins', 'bidding activity']:
+            if contract_value >= 1000:
+                value_tier = 4
+            elif contract_value >= 500:
+                value_tier = 3
+            elif contract_value >= 100:
+                value_tier = 2
+            else:
+                value_tier = 1
+        
+        elif category == 'financial':
+            if contract_value >= 5000:
+                value_tier = 4
+            elif contract_value >= 2000:
+                value_tier = 3
+            elif contract_value >= 500:
+                value_tier = 2
+            else:
+                value_tier = 1
+        
+        elif category in ['mergers & acquisitions', 'partnerships & alliances']:
+            if contract_value >= 500:
+                value_tier = 4
+            elif contract_value >= 200:
+                value_tier = 3
+            elif contract_value >= 50:
+                value_tier = 2
+            else:
+                value_tier = 1
+        
+        elif category == 'project execution':
+            if contract_value >= 1000:
+                value_tier = 4
+            elif contract_value >= 500:
+                value_tier = 3
+            elif contract_value >= 100:
+                value_tier = 2
+            else:
+                value_tier = 1
+    
+    value_points = value_tier * 5
+    
+    # TOTAL RANK SCORE
+    total_rank = category_points + relevance_points + competitor_points + geography_points + value_points
+    
+    return {
+        'rank_score': total_rank,
+        'competitor_tier': competitor_tier,
+        'category_points': category_points,
+        'relevance_points': relevance_points,
+        'competitor_points': competitor_points,
+        'geography_points': geography_points,
+        'value_points': value_points
+    }
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
 
 # ============================================================================
 # MAIN PIPELINE
