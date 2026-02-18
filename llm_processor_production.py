@@ -212,7 +212,29 @@ def load_excel_data():
         'sbus': sbu_list,
         'categories': categories_list
     }
-
+def load_competitor_tiers():
+    """Load competitor tier mapping from Excel file"""
+    
+    if not os.path.exists(EXCEL_MAPPING_FILE):
+        raise FileNotFoundError(f"❌ {EXCEL_MAPPING_FILE} not found!")
+    
+    logging.info(f"📂 Loading competitor tiers from {EXCEL_MAPPING_FILE}...")
+    
+    # Read Competitor sheet
+    competitor_df = pd.read_excel(EXCEL_MAPPING_FILE, sheet_name='Competitor', header=1)
+    
+    # Create tier mapping dictionary
+    tier_map = {}
+    for idx, row in competitor_df.iterrows():
+        competitor = row.get('Competitor')
+        tier = row.get('Tier')
+        
+        if pd.notna(competitor) and pd.notna(tier):
+            tier_map[competitor.strip()] = int(tier)
+    
+    logging.info(f"   ✅ Loaded tiers for {len(tier_map)} competitors")
+    
+    return tier_map
 
 # ============================================================================
 # BUILD DYNAMIC PROMPT (SCRIPT 4 DETAILED VERSION)
@@ -413,9 +435,35 @@ Return ONLY valid JSON with these exact field names:
   "competitor_tagging": "<comma-separated competitor names from list, or '-'>",
   "sbu_tagging": "<comma-separated SBU names from list, or 'General'>",
   "category_tag": "<single category from list>",
-  "summary": "<2-3 sentences with specific competitive intelligence>"
+  "summary": "<1-2 sentences, max 40 words with specific numbers>",
+  "contract_value_inr_crore": <numeric value in INR crore, or null if not mentioned>,
+  "geography": "<India/Middle East/Africa/Americas/SAARC/Other or null>"
 }}
 
+**EXTRACTION RULES FOR NEW FIELDS:**
+
+**contract_value_inr_crore:**
+- Extract ONLY if explicitly mentioned in article
+- Convert to INR Crore:
+  * ₹X crore → X
+  * ₹X lakh → X/100
+  * $X million → X × 85 (approx)
+  * X MW solar → null (capacity, not contract value)
+- For financial results, extract revenue/profit value
+- For M&A, extract deal value
+- If not mentioned, return null
+
+**geography:**
+- Identify primary location mentioned
+- Map to regions:
+  * "India" → Any Indian state/city
+  * "Middle East" → UAE, Saudi, Qatar, Bahrain, Oman, Kuwait
+  * "Africa" → Any African country
+  * "Americas" → USA, Brazil, etc.
+  * "SAARC" → Bangladesh, Sri Lanka, Nepal, etc.
+  * "Other" → Rest of world
+- If not clear or multiple regions, use primary project location
+- If not mentioned, return null
 ====================
 EXAMPLE 1: ORDER WIN
 ====================
@@ -427,9 +475,10 @@ CORRECT OUTPUT:
   "competitor_tagging": "L&T",
   "sbu_tagging": "Transportation",
   "category_tag": "order wins",
-  "summary": "L&T secured a ₹1,200 crore contract for Pune Metro Line 4, covering civil works for 8 elevated stations and 12 km viaduct over 36 months. This win strengthens L&T's dominant position in India's urban metro infrastructure segment where KEC competes with its transportation vertical, particularly in OHE and station works."
+  "summary": "L&T won ₹1,200 crore Pune Metro Line 4 contract covering 8 elevated stations and 12 km viaduct with 36-month timeline.",
+  "contract_value_inr_crore": 1200,
+  "geography": "India"
 }}
-
 ====================
 EXAMPLE 2: MULTI-COMPETITOR BIDDING
 ====================
@@ -441,9 +490,10 @@ CORRECT OUTPUT:
   "competitor_tagging": "L&T, Tata Projects, Kalpataru, Sterlite",
   "sbu_tagging": "India T&D",
   "category_tag": "bidding activity",
-  "summary": "Four major competitors (L&T, Tata Projects, Kalpataru, and Sterlite Power) are competing for PGCIL's ₹600 crore 400 kV Bikaner-Merta transmission line project, indicating high competition in India's transmission sector. This tender represents the competitive intensity KEC faces from tier-1 EPC players in state transmission projects."
+  "summary": "L&T, Tata Projects, Kalpataru, Sterlite competing for PGCIL's ₹600 crore 400 kV Bikaner-Merta transmission line.",
+  "contract_value_inr_crore": 600,
+  "geography": "India"
 }}
-
 ====================
 EXAMPLE 3: FINANCIAL RESULTS
 ====================
@@ -455,9 +505,10 @@ CORRECT OUTPUT:
   "competitor_tagging": "Kalpataru",
   "sbu_tagging": "General",
   "category_tag": "financial",
-  "summary": "Kalpataru Power Transmission achieved 22% revenue growth in Q4 reaching ₹4,200 crore, with a robust order book of ₹28,000 crore primarily in T&D and urban infrastructure. Their margin improvement to 8.2% and strong order book indicate operational efficiency and market traction in segments where KEC competes."
+  "summary": "Kalpataru Q4 revenue up 22% to ₹4,200 crore, order book ₹28,000 crore in T&D and urban infrastructure, margins 8.2%.",
+  "contract_value_inr_crore": 4200,
+  "geography": null
 }}
-
 Now analyze the provided article."""
 
     return prompt
