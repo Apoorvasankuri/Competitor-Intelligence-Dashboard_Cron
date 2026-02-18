@@ -181,8 +181,9 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
         feed = result['feed']
         
         for entry in feed.entries:
-            title = entry.get("title", "")
+            raw_title = entry.get("title", "")
             link = entry.get("link", "")
+            title = raw_title.rsplit(' - ', 1)[0].rsplit(' | ', 1)[0].strip()
             
             # Skip duplicates
             if link in seen_links:
