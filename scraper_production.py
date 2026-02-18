@@ -183,11 +183,6 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
         for entry in feed.entries:
             raw_title = entry.get("title", "")
             link = entry.get("link", "")
-            title = raw_title.rsplit(' - ', 1)[0].rsplit(' | ', 1)[0].strip()
-            
-            # Skip duplicates
-            if link in seen_links:
-                continue
             
             # Parse date
             try:
@@ -202,6 +197,29 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 font_tag = soup.find("font")
                 if font_tag:
                     source = font_tag.text.strip()
+            # Clean title by removing source suffix
+            title = raw_title
+            if source:
+                # Try exact match patterns first
+                patterns = [
+                    f' - {source}',
+                    f' | {source}',
+                    f' – {source}',
+                    f'- {source}',
+                    f'| {source}'
+                ]
+                for pattern in patterns:
+                    if title.endswith(pattern):
+                        title = title[:-len(pattern)].strip()
+                        break
+    
+            # Fallback: remove anything after last separator
+            if title == raw_title:  # If no exact match found
+                title = raw_title.rsplit(' - ', 1)[0].rsplit(' | ', 1)[0].rsplit(' – ', 1)[0].strip()
+    
+            # Skip duplicates
+            if link in seen_links:
+                continue
             
             # Detect competitor (must match to proceed)
             competitor = detect_competitor(title, source, competitor_to_sbu, competitor_keywords)
