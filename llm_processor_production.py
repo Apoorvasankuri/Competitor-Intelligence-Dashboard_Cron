@@ -796,10 +796,19 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
             df.at[idx, 'geography'] = analysis.get('geography')
     
             time.sleep(RATE_LIMIT_DELAY)
-
-        logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
-
-        return df
+    
+    # Calculate ranking for all high-relevance articles
+    logging.info(f"\n📊 Calculating ranking scores...")
+    for idx, row in high_rel_df.iterrows():
+        rank_data = calculate_rank_score(df.loc[idx], competitor_tier_map)
+        df.at[idx, 'rank_score'] = rank_data['rank_score']
+        df.at[idx, 'competitor_tier'] = rank_data['competitor_tier']
+        
+        logging.info(f"   Rank {rank_data['rank_score']}: {df.loc[idx, 'News Title'][:60]}...")
+    
+    logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
+    
+    return df
 
 def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
     """Fast deduplication based on title similarity"""
