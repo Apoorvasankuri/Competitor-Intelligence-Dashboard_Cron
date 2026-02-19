@@ -1005,6 +1005,7 @@ def main():
     # Load Excel mapping data
     try:
         excel_data = load_excel_data()
+        competitor_tier_map = load_competitor_tiers()
     except Exception as e:
         logging.error(f"❌ Failed to load Excel data: {e}")
         return
@@ -1021,7 +1022,7 @@ def main():
     df = stage1_quick_scoring(df)
     
     # Stage 2: Full analysis (only high-relevance)
-    df = stage2_full_analysis(df, full_prompt)
+    df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
     
     # Deduplicate high-relevance articles
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
