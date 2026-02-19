@@ -115,7 +115,7 @@ def save_to_processed_articles(df: pd.DataFrame):
         published_date,
         news_title,
         link,
-        Source,
+        "Source",
         relevance_score,
         competitor_tagging,
         sbu_tagging,
