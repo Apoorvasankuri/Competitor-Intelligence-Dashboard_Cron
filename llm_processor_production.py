@@ -111,22 +111,26 @@ def save_to_processed_articles(df: pd.DataFrame):
     conn = get_db_connection()
     
     insert_query = """
-        INSERT INTO processed_articles (
-            published_date,
-            news_title,
-            link,
-            Source,
-            relevance_score,
-            competitor_tagging,
-            sbu_tagging,
-            category_tag,
-            summary,
-            scraped_content
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s
-        )
-        ON CONFLICT (link, published_date) DO NOTHING
-    """
+    INSERT INTO processed_articles (
+        published_date,
+        news_title,
+        link,
+        Source,
+        relevance_score,
+        competitor_tagging,
+        sbu_tagging,
+        category_tag,
+        summary,
+        scraped_content,
+        contract_value_inr_crore,
+        geography,
+        competitor_tier,
+        rank_score
+    ) VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (link, published_date) DO NOTHING
+"""
     
     saved_count = 0
     failed_count = 0
@@ -138,12 +142,17 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('Published Date'),
                 row.get('News Title'),
                 row.get('Link'),
+                row.get('Source', ''),
                 row.get('relevance_score', 0),
                 row.get('competitor_tagging', '-'),
                 row.get('sbu_tagging', 'None'),
                 row.get('category_tag', 'not_analyzed'),
                 row.get('summary', ''),
-                row.get('scraped_content', '')
+                row.get('scraped_content', ''),
+                row.get('contract_value_inr_crore'),
+                row.get('geography'),
+                row.get('competitor_tier'),
+                row.get('rank_score', 0)
             ))
             conn.commit()
             cur.close()
