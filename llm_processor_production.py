@@ -820,33 +820,205 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     return df
 
 def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
-    """Fast deduplication based on title similarity"""
+    """
+    Enhanced deduplication with multiple strategies:
+    1. Exact title match
+    2. Fuzzy title similarity (>85%)
+    3. Same value + same competitor + similar date
+    4. Core content extraction and matching
+    """
     
     logging.info("\n🔍 Deduplicating articles...")
     
+    if df.empty:
+        return df
+    
     df_reset = df.reset_index(drop=True)
     to_drop = set()
+    
+    # Strategy 1: Exact title duplicates
+    seen_titles = {}
+    for i in range(len(df_reset)):
+        title = str(df_reset.iloc[i]['News Title']).lower().strip()
+        if title in seen_titles:
+            to_drop.add(i)
+            logging.debug(f"   Exact duplicate: {title[:50]}...")
+        else:
+            seen_titles[title] = i
+    
+    logging.info(f"   Found {len(to_drop)} exact title duplicates")
+    
+    # Strategy 2 & 3: Fuzzy matching + value matching
+    initial_drop_count = len(to_drop)
     
     for i in range(len(df_reset)):
         if i in to_drop:
             continue
         
         title_i = str(df_reset.iloc[i]['News Title']).lower()
+        date_i = df_reset.iloc[i]['Published Date']
+        competitor_i = str(df_reset.iloc[i].get('Competitor', '')).lower()
         
-        for j in range(i + 1, min(i + 50, len(df_reset))):
+        # Extract numbers from title (contract values)
+        numbers_i = extract_numbers_from_text(title_i)
+        
+        # Only compare with articles in similar time window (±3 days)
+        for j in range(i + 1, min(i + 100, len(df_reset))):
             if j in to_drop:
                 continue
             
             title_j = str(df_reset.iloc[j]['News Title']).lower()
+            date_j = df_reset.iloc[j]['Published Date']
+            competitor_j = str(df_reset.iloc[j].get('Competitor', '')).lower()
+            
+            # Check date proximity (within 3 days)
+            try:
+                date_diff = abs((date_i - date_j).days) if hasattr(date_i, 'days') else 0
+            except:
+                date_diff = 0
+            
+            if date_diff > 3:
+                continue
+            
+            # Extract numbers from second title
+            numbers_j = extract_numbers_from_text(title_j)
+            
+            # Check 1: Fuzzy title similarity
             similarity = SequenceMatcher(None, title_i, title_j).ratio()
             
+            # Check 2: Same competitor
+            same_competitor = (competitor_i == competitor_j and competitor_i != '')
+            
+            # Check 3: Similar contract value
+            same_value = has_similar_numbers(numbers_i, numbers_j)
+            
+            # Check 4: Core content match (extract keywords)
+            core_match = has_core_content_match(title_i, title_j)
+            
+            # Decision logic
+            is_duplicate = False
+            
+            # Very high similarity = duplicate
             if similarity > 0.85:
+                is_duplicate = True
+                logging.debug(f"   High similarity ({similarity:.2f}): {title_j[:50]}...")
+            
+            # Same competitor + same value + same date = duplicate
+            elif same_competitor and same_value and date_diff <= 1:
+                is_duplicate = True
+                logging.debug(f"   Same value+competitor: {title_j[:50]}...")
+            
+            # Same competitor + core content match + recent = duplicate
+            elif same_competitor and core_match and date_diff <= 2:
+                is_duplicate = True
+                logging.debug(f"   Core content match: {title_j[:50]}...")
+            
+            if is_duplicate:
                 to_drop.add(j)
     
-    logging.info(f"   🗑️ Removed {len(to_drop)} duplicates")
+    fuzzy_drop_count = len(to_drop) - initial_drop_count
+    logging.info(f"   Found {fuzzy_drop_count} fuzzy/value duplicates")
+    
+    logging.info(f"   🗑️ Total removed: {len(to_drop)} duplicates ({len(to_drop)/len(df_reset)*100:.1f}%)")
     
     return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
 
+
+def extract_numbers_from_text(text: str) -> List[float]:
+    """Extract all numbers (contract values) from text"""
+    # Match patterns like: 35.54, 35,54, 3554, Rs 35 crore, ₹35.6 crore
+    numbers = []
+    
+    # Pattern 1: Direct numbers with crore/lakh
+    patterns = [
+        r'(?:rs|₹|inr)?\s*(\d+(?:[,.]\d+)*)\s*(?:crore|cr)',
+        r'(?:rs|₹|inr)?\s*(\d+(?:[,.]\d+)*)\s*(?:lakh|lac)',
+        r'(\d+(?:[,.]\d+)*)\s*(?:million|mn)',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            # Normalize: remove commas, convert to float
+            num_str = match.replace(',', '')
+            try:
+                num = float(num_str)
+                # Convert to crore for comparison
+                if 'lakh' in text[text.find(match):text.find(match)+50].lower():
+                    num = num / 100  # lakh to crore
+                elif 'million' in text[text.find(match):text.find(match)+50].lower():
+                    num = num * 0.85 / 10  # million to crore (approx)
+                numbers.append(num)
+            except:
+                pass
+    
+    return numbers
+
+
+def has_similar_numbers(numbers1: List[float], numbers2: List[float]) -> bool:
+    """Check if two lists of numbers have similar values (within 5% tolerance)"""
+    if not numbers1 or not numbers2:
+        return False
+    
+    for n1 in numbers1:
+        for n2 in numbers2:
+            # Check if within 5% of each other
+            if n1 > 0 and n2 > 0:
+                diff_pct = abs(n1 - n2) / max(n1, n2) * 100
+                if diff_pct < 5:  # Within 5%
+                    return True
+    
+    return False
+
+
+def has_core_content_match(title1: str, title2: str) -> bool:
+    """
+    Check if two titles have the same core content
+    (same keywords, ignoring filler words)
+    """
+    # Remove common filler words
+    stop_words = {
+        'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+        'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+        'can', 'could', 'should', 'may', 'might', 'must', 'its', 'their',
+        'worth', 'order', 'contract', 'project', 'wins', 'bags', 'secures',
+        'gets', 'receives', 'awarded', 'adds', 'another', 'growing', 'book'
+    }
+    
+    # Extract keywords from both titles
+    words1 = set(re.findall(r'\b\w+\b', title1.lower()))
+    words2 = set(re.findall(r'\b\w+\b', title2.lower()))
+    
+    # Remove stop words
+    keywords1 = words1 - stop_words
+    keywords2 = words2 - stop_words
+    
+    # Calculate overlap
+    if not keywords1 or not keywords2:
+        return False
+    
+    overlap = len(keywords1 & keywords2)
+    total = min(len(keywords1), len(keywords2))
+    
+    overlap_pct = overlap / total * 100 if total > 0 else 0
+    
+    # If 60%+ keywords overlap = same content
+    return overlap_pct >= 60
+```
+
+---
+
+## **How This Works:**
+
+### **Your Example:**
+```
+1. "Railway signalling company receives an order worth Rs 35,54,82,968 from Railways"
+2. "RailTel bags ₹35.6 crore railway signalling order from North Central Railway"
+3. "RailTel Secures ₹35 Crore Railway Signalling Project"
+4. "RailTel bags Rs 35.55 crore signalling contract in North Central Railway"
+5. "RailTel Corporation of India order worth Rs 36 crore"
+6. "RailTel Wins ₹35.54 Crore Order, Adds Another Project to Its Growing Order Book"
 
 # ADD THIS NEW FUNCTION HERE (after line 826)
 def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) -> Dict:
