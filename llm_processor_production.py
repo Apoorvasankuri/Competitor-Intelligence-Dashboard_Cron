@@ -221,6 +221,8 @@ def load_excel_data():
         'sbus': sbu_list,
         'categories': categories_list
     }
+
+
 def load_competitor_tiers():
     """Load competitor tier mapping from Excel file"""
     
@@ -244,6 +246,7 @@ def load_competitor_tiers():
     logging.info(f"   ✅ Loaded tiers for {len(tier_map)} competitors")
     
     return tier_map
+
 
 # ============================================================================
 # BUILD DYNAMIC PROMPT (SCRIPT 4 DETAILED VERSION)
@@ -819,164 +822,63 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     
     return df
 
-def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enhanced deduplication with multiple strategies:
-    1. Exact title match
-    2. Fuzzy title similarity (>85%)
-    3. Same value + same competitor + similar date
-    4. Core content extraction and matching
-    """
-    
-    logging.info("\n🔍 Deduplicating articles...")
-    
-    if df.empty:
-        return df
-    
-    df_reset = df.reset_index(drop=True)
-    to_drop = set()
-    
-    # Strategy 1: Exact title duplicates
-    seen_titles = {}
-    for i in range(len(df_reset)):
-        title = str(df_reset.iloc[i]['News Title']).lower().strip()
-        if title in seen_titles:
-            to_drop.add(i)
-            logging.debug(f"   Exact duplicate: {title[:50]}...")
-        else:
-            seen_titles[title] = i
-    
-    logging.info(f"   Found {len(to_drop)} exact title duplicates")
-    
-    # Strategy 2 & 3: Fuzzy matching + value matching
-    initial_drop_count = len(to_drop)
-    
-    for i in range(len(df_reset)):
-        if i in to_drop:
-            continue
-        
-        title_i = str(df_reset.iloc[i]['News Title']).lower()
-        date_i = df_reset.iloc[i]['Published Date']
-        competitor_i = str(df_reset.iloc[i].get('Competitor', '')).lower()
-        
-        # Extract numbers from title (contract values)
-        numbers_i = extract_numbers_from_text(title_i)
-        
-        # Only compare with articles in similar time window (±3 days)
-        for j in range(i + 1, min(i + 100, len(df_reset))):
-            if j in to_drop:
-                continue
-            
-            title_j = str(df_reset.iloc[j]['News Title']).lower()
-            date_j = df_reset.iloc[j]['Published Date']
-            competitor_j = str(df_reset.iloc[j].get('Competitor', '')).lower()
-            
-            # Check date proximity (within 3 days)
-            try:
-                date_diff = abs((date_i - date_j).days) if hasattr(date_i, 'days') else 0
-            except:
-                date_diff = 0
-            
-            if date_diff > 3:
-                continue
-            
-            # Extract numbers from second title
-            numbers_j = extract_numbers_from_text(title_j)
-            
-            # Check 1: Fuzzy title similarity
-            similarity = SequenceMatcher(None, title_i, title_j).ratio()
-            
-            # Check 2: Same competitor
-            same_competitor = (competitor_i == competitor_j and competitor_i != '')
-            
-            # Check 3: Similar contract value
-            same_value = has_similar_numbers(numbers_i, numbers_j)
-            
-            # Check 4: Core content match (extract keywords)
-            core_match = has_core_content_match(title_i, title_j)
-            
-            # Decision logic
-            is_duplicate = False
-            
-            # Very high similarity = duplicate
-            if similarity > 0.85:
-                is_duplicate = True
-                logging.debug(f"   High similarity ({similarity:.2f}): {title_j[:50]}...")
-            
-            # Same competitor + same value + same date = duplicate
-            elif same_competitor and same_value and date_diff <= 1:
-                is_duplicate = True
-                logging.debug(f"   Same value+competitor: {title_j[:50]}...")
-            
-            # Same competitor + core content match + recent = duplicate
-            elif same_competitor and core_match and date_diff <= 2:
-                is_duplicate = True
-                logging.debug(f"   Core content match: {title_j[:50]}...")
-            
-            if is_duplicate:
-                to_drop.add(j)
-    
-    fuzzy_drop_count = len(to_drop) - initial_drop_count
-    logging.info(f"   Found {fuzzy_drop_count} fuzzy/value duplicates")
-    
-    logging.info(f"   🗑️ Total removed: {len(to_drop)} duplicates ({len(to_drop)/len(df_reset)*100:.1f}%)")
-    
-    return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
 
+# ============================================================================
+# DEDUPLICATION - PHASE 1: STRING-BASED (FAST)
+# ============================================================================
 
 def extract_numbers_from_text(text: str) -> List[float]:
-    """Extract all numbers (contract values) from text"""
-    # Match patterns like: 35.54, 35,54, 3554, Rs 35 crore, ₹35.6 crore
+    """Extract all contract values from text, handling Indian number formats"""
     numbers = []
-    
-    # Pattern 1: Direct numbers with crore/lakh
+
+    # Handle Indian format: Rs 35,54,82,968 → convert to crore
+    indian_format = re.findall(r'(?:rs|₹|inr)\.?\s*([\d,]+)', text, re.IGNORECASE)
+    for match in indian_format:
+        num_str = match.replace(',', '')
+        try:
+            num = float(num_str)
+            # If number looks like full rupees (>10 million), convert to crore
+            if num > 10_000_000:
+                num = num / 10_000_000
+            elif num > 100_000:
+                num = num / 10_000_000
+            numbers.append(round(num, 2))
+        except:
+            pass
+
+    # Handle crore/lakh/million explicitly stated
     patterns = [
-        r'(?:rs|₹|inr)?\s*(\d+(?:[,.]\d+)*)\s*(?:crore|cr)',
-        r'(?:rs|₹|inr)?\s*(\d+(?:[,.]\d+)*)\s*(?:lakh|lac)',
-        r'(\d+(?:[,.]\d+)*)\s*(?:million|mn)',
+        (r'(?:rs|₹|inr)?\.?\s*(\d+(?:[,.]\d+)*)\s*(?:crore|cr)', 1.0),
+        (r'(?:rs|₹|inr)?\.?\s*(\d+(?:[,.]\d+)*)\s*(?:lakh|lac)', 0.01),
+        (r'(\d+(?:[,.]\d+)*)\s*(?:million|mn)', 8.5),
     ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
-            # Normalize: remove commas, convert to float
-            num_str = match.replace(',', '')
+
+    for pattern, multiplier in patterns:
+        for match in re.findall(pattern, text, re.IGNORECASE):
             try:
-                num = float(num_str)
-                # Convert to crore for comparison
-                if 'lakh' in text[text.find(match):text.find(match)+50].lower():
-                    num = num / 100  # lakh to crore
-                elif 'million' in text[text.find(match):text.find(match)+50].lower():
-                    num = num * 0.85 / 10  # million to crore (approx)
-                numbers.append(num)
+                num = float(match.replace(',', '')) * multiplier
+                numbers.append(round(num, 2))
             except:
                 pass
-    
+
     return numbers
 
 
 def has_similar_numbers(numbers1: List[float], numbers2: List[float]) -> bool:
-    """Check if two lists of numbers have similar values (within 5% tolerance)"""
+    """Check if two lists of numbers have similar values (within 10% tolerance)"""
     if not numbers1 or not numbers2:
         return False
-    
     for n1 in numbers1:
         for n2 in numbers2:
-            # Check if within 5% of each other
             if n1 > 0 and n2 > 0:
                 diff_pct = abs(n1 - n2) / max(n1, n2) * 100
-                if diff_pct < 5:  # Within 5%
+                if diff_pct < 10:
                     return True
-    
     return False
 
 
 def has_core_content_match(title1: str, title2: str) -> bool:
-    """
-    Check if two titles have the same core content
-    (same keywords, ignoring filler words)
-    """
-    # Remove common filler words
+    """Check if two titles share core content keywords"""
     stop_words = {
         'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
@@ -985,41 +887,444 @@ def has_core_content_match(title1: str, title2: str) -> bool:
         'worth', 'order', 'contract', 'project', 'wins', 'bags', 'secures',
         'gets', 'receives', 'awarded', 'adds', 'another', 'growing', 'book'
     }
-    
-    # Extract keywords from both titles
-    words1 = set(re.findall(r'\b\w+\b', title1.lower()))
-    words2 = set(re.findall(r'\b\w+\b', title2.lower()))
-    
-    # Remove stop words
-    keywords1 = words1 - stop_words
-    keywords2 = words2 - stop_words
-    
-    # Calculate overlap
-    if not keywords1 or not keywords2:
+    words1 = set(re.findall(r'\b\w+\b', title1.lower())) - stop_words
+    words2 = set(re.findall(r'\b\w+\b', title2.lower())) - stop_words
+    if not words1 or not words2:
         return False
-    
-    overlap = len(keywords1 & keywords2)
-    total = min(len(keywords1), len(keywords2))
-    
-    overlap_pct = overlap / total * 100 if total > 0 else 0
-    
-    # If 60%+ keywords overlap = same content
-    return overlap_pct >= 60
+    overlap = len(words1 & words2)
+    total = min(len(words1), len(words2))
+    return (overlap / total * 100) >= 60 if total > 0 else False
 
-# ADD THIS NEW FUNCTION HERE (after line 826)
+
+def phase1_string_dedup(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Phase 1: Fast string-based deduplication.
+    Catches exact matches, fuzzy matches, and value+competitor matches.
+    """
+    logging.info("\n🔍 Phase 1: String-based deduplication...")
+
+    if df.empty:
+        return df
+
+    df_reset = df.reset_index(drop=True)
+    to_drop = set()
+
+    # Strategy 1: Exact title duplicates
+    seen_titles = {}
+    for i in range(len(df_reset)):
+        title = str(df_reset.iloc[i]['News Title']).lower().strip()
+        if title in seen_titles:
+            to_drop.add(i)
+        else:
+            seen_titles[title] = i
+
+    exact_count = len(to_drop)
+    logging.info(f"   Exact duplicates: {exact_count}")
+
+    # Strategy 2: Fuzzy + value + core content matching
+    for i in range(len(df_reset)):
+        if i in to_drop:
+            continue
+
+        title_i = str(df_reset.iloc[i]['News Title']).lower()
+        date_i = df_reset.iloc[i]['Published Date']
+        competitor_i = str(df_reset.iloc[i].get('competitor_tagging') or df_reset.iloc[i].get('Competitor') or '').lower()
+        numbers_i = extract_numbers_from_text(title_i)
+
+        for j in range(i + 1, min(i + 100, len(df_reset))):
+            if j in to_drop:
+                continue
+
+            title_j = str(df_reset.iloc[j]['News Title']).lower()
+            date_j = df_reset.iloc[j]['Published Date']
+            competitor_j = str(df_reset.iloc[j].get('competitor_tagging') or df_reset.iloc[j].get('Competitor') or '').lower()
+
+            try:
+                date_diff = abs((date_i - date_j).days)
+            except:
+                date_diff = 0
+
+            if date_diff > 3:
+                continue
+
+            numbers_j = extract_numbers_from_text(title_j)
+            similarity = SequenceMatcher(None, title_i, title_j).ratio()
+            same_competitor = (competitor_i == competitor_j and competitor_i not in ('', '-'))
+            same_value = has_similar_numbers(numbers_i, numbers_j)
+            core_match = has_core_content_match(title_i, title_j)
+
+            is_duplicate = False
+            if similarity > 0.85:
+                is_duplicate = True
+            elif same_competitor and same_value and date_diff <= 1:
+                is_duplicate = True
+            elif same_competitor and core_match and date_diff <= 2:
+                is_duplicate = True
+
+            if is_duplicate:
+                to_drop.add(j)
+
+    fuzzy_count = len(to_drop) - exact_count
+    logging.info(f"   Fuzzy/value duplicates: {fuzzy_count}")
+    logging.info(f"   Phase 1 total removed: {len(to_drop)} | Remaining: {len(df_reset) - len(to_drop)}")
+
+    return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
+
+
+# ============================================================================
+# DEDUPLICATION - PHASE 2: LLM-BASED (SEMANTIC)
+# ============================================================================
+
+# Category-specific fields to extract for fingerprinting
+CATEGORY_FINGERPRINT_FIELDS = {
+    "order wins":               ["company", "client_or_authority", "contract_value_crore", "scope", "location"],
+    "bidding activity":         ["companies_bidding", "client_or_authority", "project_value_crore", "scope", "location"],
+    "financial":                ["company", "period", "revenue_crore", "profit_crore", "order_book_crore"],
+    "project execution":        ["company", "project_name", "capacity_or_scale", "location", "milestone"],
+    "mergers & acquisitions":   ["acquirer", "target_company", "deal_value_crore", "stake_percent"],
+    "partnerships & alliances": ["companies_involved", "deal_type", "sector", "value_crore"],
+    "stock market":             ["company", "price_movement_percent", "trigger_event"],
+    "regulatory & policy":      ["authority", "policy_or_rule", "sector_affected"],
+    "industry trends":          ["topic", "key_stat", "geography"],
+    "legal & disputes":         ["company", "counterparty", "issue_type", "value_crore"],
+}
+
+FINGERPRINT_SYSTEM_PROMPT = """You are a news deduplication assistant for a competitive intelligence system.
+
+Your job is to read a news article and extract a structured fingerprint of the KEY FACTS that identify this specific event.
+The fingerprint will be used to detect if multiple articles are reporting the same underlying news event.
+
+Extract ONLY facts explicitly stated in the article. Use null for anything not mentioned.
+Return ONLY valid JSON, no explanation."""
+
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RateLimitError),
+    reraise=True
+)
+def extract_fingerprint(title: str, content: str, category: str) -> Dict:
+    """Extract a semantic fingerprint from an article based on its category"""
+
+    fields = CATEGORY_FINGERPRINT_FIELDS.get(
+        category.lower(),
+        ["company", "event_type", "value", "location"]  # fallback
+    )
+
+    fields_desc = "\n".join([f'  "{f}": <extracted value or null>' for f in fields])
+
+    prompt = f"""Article Title: {title}
+
+Article Content: {content[:2000] if content else 'Not available'}
+
+Category: {category}
+
+Extract the following key facts from this article and return as JSON:
+{{
+{fields_desc}
+}}
+
+Rules:
+- Extract ONLY facts explicitly stated
+- For values/numbers: normalize to crore (e.g. Rs 35,54,82,968 = 35.55 crore, Rs 1200 crore = 1200)
+- For company names: use the most common/standard form
+- For scope: include MW/km/units as mentioned
+- Use null if not mentioned"""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=300,
+            temperature=0,
+            system=FINGERPRINT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        raw = response.content[0].text.strip()
+        raw = re.sub(r'^```json\s*', '', raw)
+        raw = re.sub(r'^```\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if json_match:
+            return json.loads(json_match.group(0))
+        return {}
+
+    except Exception as e:
+        logging.warning(f"Fingerprint extraction failed for '{title[:50]}': {e}")
+        return {}
+
+
+def fingerprints_match(fp1: Dict, fp2: Dict, category: str) -> bool:
+    """
+    Compare two fingerprints to determine if they represent the same event.
+    Uses category-specific matching logic.
+    """
+    if not fp1 or not fp2:
+        return False
+
+    cat = category.lower()
+
+    def normalize(val):
+        if val is None:
+            return None
+        return str(val).lower().strip()
+
+    def values_similar(v1, v2, tolerance=0.10):
+        try:
+            n1, n2 = float(v1), float(v2)
+            if n1 == 0 and n2 == 0:
+                return True
+            if n1 == 0 or n2 == 0:
+                return False
+            return abs(n1 - n2) / max(n1, n2) <= tolerance
+        except:
+            return False
+
+    def company_match(c1, c2):
+        if not c1 or not c2:
+            return False
+        c1, c2 = normalize(c1), normalize(c2)
+        if c1 == c2 or c1 in c2 or c2 in c1:
+            return True
+        return SequenceMatcher(None, c1, c2).ratio() > 0.80
+
+    if cat == "order wins":
+        company_ok = company_match(fp1.get('company'), fp2.get('company'))
+        if not company_ok:
+            return False
+        v1, v2 = fp1.get('contract_value_crore'), fp2.get('contract_value_crore')
+        value_ok = values_similar(v1, v2) if (v1 and v2) else True
+        client_ok = company_match(fp1.get('client_or_authority'), fp2.get('client_or_authority'))
+        scope1, scope2 = normalize(fp1.get('scope')), normalize(fp2.get('scope'))
+        scope_ok = (scope1 and scope2 and (scope1 in scope2 or scope2 in scope1)) or (not scope1 or not scope2)
+        location_ok = normalize(fp1.get('location')) == normalize(fp2.get('location')) or not fp1.get('location') or not fp2.get('location')
+        return company_ok and value_ok and (client_ok or scope_ok) and location_ok
+
+    elif cat == "bidding activity":
+        client_ok = company_match(fp1.get('client_or_authority'), fp2.get('client_or_authority'))
+        v1, v2 = fp1.get('project_value_crore'), fp2.get('project_value_crore')
+        value_ok = values_similar(v1, v2) if (v1 and v2) else True
+        location_ok = normalize(fp1.get('location')) == normalize(fp2.get('location')) or not fp1.get('location') or not fp2.get('location')
+        return client_ok and value_ok and location_ok
+
+    elif cat == "financial":
+        company_ok = company_match(fp1.get('company'), fp2.get('company'))
+        period_ok = normalize(fp1.get('period')) == normalize(fp2.get('period')) or not fp1.get('period') or not fp2.get('period')
+        v1, v2 = fp1.get('revenue_crore'), fp2.get('revenue_crore')
+        revenue_ok = values_similar(v1, v2) if (v1 and v2) else True
+        return company_ok and period_ok and revenue_ok
+
+    elif cat == "mergers & acquisitions":
+        acquirer_ok = company_match(fp1.get('acquirer'), fp2.get('acquirer'))
+        target_ok = company_match(fp1.get('target_company'), fp2.get('target_company'))
+        v1, v2 = fp1.get('deal_value_crore'), fp2.get('deal_value_crore')
+        value_ok = values_similar(v1, v2) if (v1 and v2) else True
+        return acquirer_ok and target_ok and value_ok
+
+    elif cat == "partnerships & alliances":
+        companies1 = normalize(fp1.get('companies_involved') or '')
+        companies2 = normalize(fp2.get('companies_involved') or '')
+        companies_ok = SequenceMatcher(None, companies1, companies2).ratio() > 0.70 if companies1 and companies2 else False
+        sector_ok = normalize(fp1.get('sector')) == normalize(fp2.get('sector')) or not fp1.get('sector') or not fp2.get('sector')
+        return companies_ok and sector_ok
+
+    elif cat == "project execution":
+        company_ok = company_match(fp1.get('company'), fp2.get('company'))
+        location_ok = normalize(fp1.get('location')) == normalize(fp2.get('location')) or not fp1.get('location') or not fp2.get('location')
+        scale1, scale2 = normalize(fp1.get('capacity_or_scale')), normalize(fp2.get('capacity_or_scale'))
+        scale_ok = (scale1 and scale2 and SequenceMatcher(None, scale1, scale2).ratio() > 0.70) or not scale1 or not scale2
+        return company_ok and location_ok and scale_ok
+
+    elif cat == "stock market":
+        company_ok = company_match(fp1.get('company'), fp2.get('company'))
+        trigger1, trigger2 = normalize(fp1.get('trigger_event')), normalize(fp2.get('trigger_event'))
+        trigger_ok = (trigger1 and trigger2 and SequenceMatcher(None, trigger1, trigger2).ratio() > 0.70) or not trigger1 or not trigger2
+        return company_ok and trigger_ok
+
+    else:
+        # Generic: fuzzy match on all string fields
+        matches = 0
+        total = 0
+        for key in fp1:
+            if fp1[key] and fp2.get(key):
+                total += 1
+                if normalize(fp1[key]) == normalize(fp2[key]) or SequenceMatcher(None, normalize(fp1[key]), normalize(fp2[key])).ratio() > 0.75:
+                    matches += 1
+        return (matches / total) >= 0.6 if total > 0 else False
+
+
+def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Phase 2: LLM-based semantic deduplication.
+    Groups articles by competitor, extracts fingerprints, compares within each group.
+    Keeps the article with the highest rank_score from each duplicate group.
+    """
+    logging.info("\n🤖 Phase 2: LLM semantic deduplication...")
+
+    if df.empty or len(df) <= 1:
+        return df
+
+    if 'rank_score' not in df.columns:
+        df['rank_score'] = 0
+
+    df_reset = df.reset_index(drop=True)
+
+    # Step 1: Scrape articles in parallel for content
+    logging.info(f"   📥 Scraping content for {len(df_reset)} articles...")
+
+    contents = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(scrape_article, row['Link']): idx
+            for idx, row in df_reset.iterrows()
+            if pd.notna(row.get('Link'))
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            contents[idx] = future.result()
+
+    # Step 2: Extract fingerprints via LLM
+    logging.info(f"   🔑 Extracting fingerprints...")
+    fingerprints = {}
+    for idx, row in df_reset.iterrows():
+        title = str(row['News Title'])
+        content = contents.get(idx, str(row.get('scraped_content', '')))
+        category = str(row.get('category_tag', 'order wins'))
+
+        fp = extract_fingerprint(title, content, category)
+        fingerprints[idx] = fp
+
+        logging.info(f"   [{idx+1}/{len(df_reset)}] {title[:60]}...")
+        time.sleep(RATE_LIMIT_DELAY)
+
+    # Step 3: Group by competitor, compare fingerprints within each group
+    logging.info("\n   🔍 Comparing fingerprints within competitor groups...")
+
+    to_drop = set()
+    competitor_groups: Dict[str, List[int]] = {}
+
+    for idx, row in df_reset.iterrows():
+        competitor_raw = str(row.get('competitor_tagging') or row.get('Competitor') or 'General')
+        competitors = [c.strip() for c in competitor_raw.split(',') if c.strip() and c.strip() != '-']
+        if not competitors:
+            competitors = ['General']
+        for comp in competitors:
+            if comp not in competitor_groups:
+                competitor_groups[comp] = []
+            competitor_groups[comp].append(idx)
+
+    logging.info(f"   📦 {len(competitor_groups)} competitor groups to compare...")
+
+    already_compared = set()
+
+    for comp, indices in competitor_groups.items():
+        if len(indices) <= 1:
+            continue
+
+        logging.info(f"   👥 {comp}: {len(indices)} articles")
+
+        for i in range(len(indices)):
+            idx_i = indices[i]
+            if idx_i in to_drop:
+                continue
+
+            for j in range(i + 1, len(indices)):
+                idx_j = indices[j]
+                if idx_j in to_drop:
+                    continue
+
+                pair = (min(idx_i, idx_j), max(idx_i, idx_j))
+                if pair in already_compared:
+                    continue
+                already_compared.add(pair)
+
+                row_i = df_reset.iloc[idx_i]
+                row_j = df_reset.iloc[idx_j]
+
+                # Only compare articles within 3 days of each other
+                try:
+                    date_diff = abs((row_i['Published Date'] - row_j['Published Date']).days)
+                except:
+                    date_diff = 0
+
+                if date_diff > 3:
+                    continue
+
+                # Only compare same category articles
+                cat_i = str(row_i.get('category_tag', '')).lower()
+                cat_j = str(row_j.get('category_tag', '')).lower()
+                if cat_i != cat_j:
+                    continue
+
+                fp_i = fingerprints.get(idx_i, {})
+                fp_j = fingerprints.get(idx_j, {})
+
+                if fingerprints_match(fp_i, fp_j, cat_i):
+                    # Keep higher rank_score, drop the other
+                    score_i = float(row_i.get('rank_score') or 0)
+                    score_j = float(row_j.get('rank_score') or 0)
+
+                    drop_idx = idx_j if score_i >= score_j else idx_i
+                    to_drop.add(drop_idx)
+
+                    keep_title = row_i['News Title'] if score_i >= score_j else row_j['News Title']
+                    drop_title = row_j['News Title'] if score_i >= score_j else row_i['News Title']
+                    logging.info(f"   🗑️  DUPLICATE: '{drop_title[:60]}...'")
+                    logging.info(f"       KEEPING:   '{keep_title[:60]}...'")
+
+    logging.info(f"\n   Phase 2 removed: {len(to_drop)} semantic duplicates")
+    logging.info(f"   Final article count: {len(df_reset) - len(to_drop)}")
+
+    return df_reset.drop(index=list(to_drop)).reset_index(drop=True)
+
+
+def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Two-phase deduplication:
+    Phase 1 — Fast string-based (exact, fuzzy, value matching)
+    Phase 2 — LLM semantic deduplication grouped by competitor
+    """
+    logging.info("\n" + "="*60)
+    logging.info("DEDUPLICATION: TWO-PHASE")
+    logging.info("="*60)
+
+    initial_count = len(df)
+    logging.info(f"   Starting with: {initial_count} articles")
+
+    # Phase 1: String-based
+    df = phase1_string_dedup(df)
+    after_phase1 = len(df)
+    logging.info(f"   After Phase 1: {after_phase1} articles ({initial_count - after_phase1} removed)")
+
+    # Phase 2: LLM semantic
+    df = phase2_llm_dedup(df)
+    after_phase2 = len(df)
+    logging.info(f"   After Phase 2: {after_phase2} articles ({after_phase1 - after_phase2} removed)")
+
+    logging.info(f"\n✅ Dedup complete: {initial_count} → {after_phase2} articles ({initial_count - after_phase2} total removed)")
+
+    return df
+
+
+# ============================================================================
+# RANKING
+# ============================================================================
+
 def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) -> Dict:
     """
     Calculate ranking score for an article
-    
+
     Formula:
     Rank Score = (Category × 50) + (Relevance) + (Competitor Tier × 10) + (Geography × 5) + (Value Tier × 5)
-    
+
     Returns dict with rank_score and component breakdowns
     """
-    
+
     # 1. CATEGORY WEIGHT (0-3) × 50 = 0-150 points
     category = str(row.get('category_tag', '')).lower()
-    
+
     category_weights = {
         'order wins': 3,
         'bidding activity': 3,
@@ -1029,34 +1334,34 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
         'financial': 1,
         'stock market': 1,
     }
-    
+
     category_weight = category_weights.get(category, 0)
     category_points = category_weight * 50
-    
+
     # 2. RELEVANCE SCORE (70-100) = 70-100 points
     relevance_points = int(row.get('relevance_score', 70))
-    
+
     # 3. COMPETITOR TIER (1-3) × 10 = 10-30 points
     competitor_tagging = str(row.get('competitor_tagging', '-'))
     competitors = [c.strip() for c in competitor_tagging.split(',') if c.strip() != '-']
-    
+
     # Get highest tier (Tier 1 is best, so lowest number)
     competitor_tier = 3  # Default to lowest tier
     for comp in competitors:
         tier = competitor_tier_map.get(comp, 3)
         if tier < competitor_tier:
             competitor_tier = tier
-    
+
     # Invert: Tier 1 = 3 points, Tier 2 = 2 points, Tier 3 = 1 point
     competitor_tier_inverted = 4 - competitor_tier
     competitor_points = competitor_tier_inverted * 10
-    
+
     # 4. GEOGRAPHY BONUS (0-2) × 5 = 0-10 points
     geography = str(row.get('geography', '')).lower() if pd.notna(row.get('geography')) else ''
     sbu = str(row.get('sbu_tagging', '')).lower()
-    
+
     geography_bonus = 0
-    
+
     if 'international t&d' in sbu:
         if any(region in geography for region in ['middle east', 'uae', 'saudi', 'qatar', 'bahrain', 'oman', 'kuwait']):
             geography_bonus = 2
@@ -1068,14 +1373,14 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
     elif 'oil & gas' in sbu or 'oil and gas' in sbu:
         if 'india' in geography or 'middle east' in geography:
             geography_bonus = 2
-    
+
     geography_points = geography_bonus * 5
-    
+
     # 5. VALUE TIER (0-4) × 5 = 0-20 points
     contract_value = row.get('contract_value_inr_crore')
-    
+
     value_tier = 0
-    
+
     if pd.notna(contract_value) and contract_value > 0:
         if category in ['order wins', 'bidding activity']:
             if contract_value >= 1000:
@@ -1086,7 +1391,7 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
                 value_tier = 2
             else:
                 value_tier = 1
-        
+
         elif category == 'financial':
             if contract_value >= 5000:
                 value_tier = 4
@@ -1096,7 +1401,7 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
                 value_tier = 2
             else:
                 value_tier = 1
-        
+
         elif category in ['mergers & acquisitions', 'partnerships & alliances']:
             if contract_value >= 500:
                 value_tier = 4
@@ -1106,7 +1411,7 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
                 value_tier = 2
             else:
                 value_tier = 1
-        
+
         elif category == 'project execution':
             if contract_value >= 1000:
                 value_tier = 4
@@ -1116,12 +1421,12 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
                 value_tier = 2
             else:
                 value_tier = 1
-    
+
     value_points = value_tier * 5
-    
+
     # TOTAL RANK SCORE
     total_rank = category_points + relevance_points + competitor_points + geography_points + value_points
-    
+
     return {
         'rank_score': total_rank,
         'competitor_tier': competitor_tier,
@@ -1137,29 +1442,25 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
 # MAIN PIPELINE
 # ============================================================================
 
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
-
 def main():
     """Main execution pipeline"""
-    
+
     start_time = time.time()
-    
+
     logging.info("="*60)
     logging.info("KEC INTERNATIONAL - COMPETITIVE INTELLIGENCE ANALYZER")
     logging.info("="*60)
-    
+
     # Load raw articles from database
     logging.info("📥 Loading articles from raw_scraped_articles table...")
     df = load_raw_articles()
-    
+
     if df.empty:
         logging.info("ℹ️  No articles to process. Exiting.")
         return
-    
+
     logging.info(f"📄 Loaded {len(df)} articles")
-    
+
     # Load Excel mapping data
     try:
         excel_data = load_excel_data()
@@ -1167,7 +1468,7 @@ def main():
     except Exception as e:
         logging.error(f"❌ Failed to load Excel data: {e}")
         return
-    
+
     # Build dynamic prompt
     logging.info("\n🔧 Building enhanced analysis prompt...")
     full_prompt = build_full_analysis_prompt(
@@ -1175,30 +1476,30 @@ def main():
         categories=excel_data['categories']
     )
     logging.info(f"   ✅ Prompt built with {len(excel_data['competitors'])} competitors and {len(excel_data['categories'])} categories")
-    
+
     # Stage 1: Quick scoring
     df = stage1_quick_scoring(df)
-    
+
     # Stage 2: Full analysis (only high-relevance)
     df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
-    
-    # Deduplicate high-relevance articles
+
+    # Two-phase deduplication on high-relevance articles
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     if len(high_relevance_df) > 0:
         high_relevance_df = deduplicate_articles(high_relevance_df)
-    
+
     # Save to processed_articles table (only deduplicated high-relevance)
     logging.info("\n💾 Saving to processed_articles table...")
     save_to_processed_articles(high_relevance_df)
-    
+
     # Clear raw_scraped_articles table
     logging.info("\n🧹 Clearing raw_scraped_articles table...")
     clear_raw_articles()
-    
+
     # Statistics
     elapsed = time.time() - start_time
     high_relevance = df[df['relevance_score'] >= RELEVANCE_THRESHOLD]
-    
+
     logging.info("\n" + "="*60)
     logging.info("📈 PROCESSING COMPLETE")
     logging.info("="*60)
@@ -1206,33 +1507,35 @@ def main():
     logging.info(f"📄 Total articles processed: {len(df)}")
     logging.info(f"⭐ High relevance: {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
     logging.info(f"🎯 Final report (after dedup): {len(high_relevance_df)} articles")
-    
+
     if len(high_relevance) > 0:
         logging.info(f"\n📊 Average Relevance Score: {high_relevance['relevance_score'].mean():.1f}")
-        
+
         logging.info(f"\n📁 Top Categories:")
         for cat, count in high_relevance['category_tag'].value_counts().head(5).items():
             logging.info(f"   {cat}: {count}")
-        
+
         logging.info(f"\n📁 Top SBUs:")
         for sbu, count in high_relevance['sbu_tagging'].value_counts().head(5).items():
             logging.info(f"   {sbu}: {count}")
-        
+
         logging.info(f"\n🏢 Top Competitors:")
         for comp, count in high_relevance['competitor_tagging'].value_counts().head(5).items():
             if comp != '-':
                 logging.info(f"   {comp}: {count}")
-    
+
     # Cost estimate
     stage1_calls = len(df)
     stage2_calls = len(high_relevance)
-    total_calls = stage1_calls + stage2_calls
-    est_tokens = (stage1_calls * 200) + (stage2_calls * 7500)  # Updated for detailed prompt
+    dedup_calls = len(high_relevance_df)
+    total_calls = stage1_calls + stage2_calls + dedup_calls
+    est_tokens = (stage1_calls * 200) + (stage2_calls * 7500) + (dedup_calls * 500)
     est_cost = (est_tokens / 1_000_000) * 3.00
-    
+
     logging.info(f"\n💰 API Usage:")
     logging.info(f"   Stage 1 calls: {stage1_calls}")
     logging.info(f"   Stage 2 calls: {stage2_calls}")
+    logging.info(f"   Dedup fingerprint calls: {dedup_calls}")
     logging.info(f"   Total calls: {total_calls}")
     logging.info(f"   Est. tokens: ~{est_tokens:,}")
     logging.info(f"   Est. cost: ~${est_cost:.2f}")
