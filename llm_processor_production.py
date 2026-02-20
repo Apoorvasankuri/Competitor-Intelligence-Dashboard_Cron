@@ -1005,20 +1005,6 @@ def has_core_content_match(title1: str, title2: str) -> bool:
     
     # If 60%+ keywords overlap = same content
     return overlap_pct >= 60
-```
-
----
-
-## **How This Works:**
-
-### **Your Example:**
-```
-1. "Railway signalling company receives an order worth Rs 35,54,82,968 from Railways"
-2. "RailTel bags ₹35.6 crore railway signalling order from North Central Railway"
-3. "RailTel Secures ₹35 Crore Railway Signalling Project"
-4. "RailTel bags Rs 35.55 crore signalling contract in North Central Railway"
-5. "RailTel Corporation of India order worth Rs 36 crore"
-6. "RailTel Wins ₹35.54 Crore Order, Adds Another Project to Its Growing Order Book"
 
 # ADD THIS NEW FUNCTION HERE (after line 826)
 def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) -> Dict:
