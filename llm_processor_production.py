@@ -247,6 +247,95 @@ def load_competitor_tiers():
     
     return tier_map
 
+def load_competitor_variations():
+    """Load competitor variations from 'Competitor Key Words' column in Excel"""
+    
+    if not os.path.exists(EXCEL_MAPPING_FILE):
+        raise FileNotFoundError(f"❌ {EXCEL_MAPPING_FILE} not found!")
+    
+    logging.info(f"📂 Loading competitor variations from {EXCEL_MAPPING_FILE}...")
+    
+    # Read Competitor sheet
+    competitor_df = pd.read_excel(EXCEL_MAPPING_FILE, sheet_name='Competitor', header=1)
+    
+    # Create mapping: variation (lowercase) → official name
+    variation_to_official = {}
+    official_names = []
+    
+    for idx, row in competitor_df.iterrows():
+        official_name = row.get('Competitor')
+        keywords_raw = row.get('Competitor Key Words', '')  # USE THIS COLUMN
+        
+        if pd.notna(official_name):
+            official_names.append(official_name)
+            
+            # Map official name to itself
+            variation_to_official[official_name.lower().strip()] = official_name
+            
+            # Map all keywords/variations to official name
+            if pd.notna(keywords_raw):
+                # Extract keywords between quotes
+                variations = re.findall(r'"([^"]+)"', str(keywords_raw))
+                
+                for var in variations:
+                    var_clean = var.strip()
+                    if var_clean:
+                        variation_to_official[var_clean.lower()] = official_name
+                        
+                        # Also add common case variations
+                        variation_to_official[var_clean.upper()] = official_name
+                        variation_to_official[var_clean.title()] = official_name
+    
+    logging.info(f"   ✅ Loaded {len(official_names)} official names with {len(variation_to_official)} total variations")
+    
+    # Log some examples for verification
+    logging.info(f"   📝 Example mappings:")
+    for var, official in list(variation_to_official.items())[:5]:
+        logging.info(f"      '{var}' → '{official}'")
+    
+    return {
+        'official_names': official_names,
+        'variation_map': variation_to_official
+    }
+
+def normalize_competitors_to_official(competitor_string: str, variation_map: dict) -> str:
+    """
+    Normalize competitor names to official names from Excel
+    Input: "L&T, Tata Projects Ltd, Kalpataru Power"
+    Output: "Larsen & Toubro Limited, Tata Projects Limited, Kalpataru Projects International Limited"
+    """
+    
+    if not competitor_string or competitor_string.strip() in ['-', '', 'None']:
+        return '-'
+    
+    # Split by comma
+    competitors = [c.strip() for c in competitor_string.split(',')]
+    
+    # Normalize each
+    normalized = set()  # Use set to avoid duplicates
+    
+    for comp in competitors:
+        comp_lower = comp.lower().strip()
+        
+        # Look up in variation map
+        if comp_lower in variation_map:
+            official_name = variation_map[comp_lower]
+            normalized.add(official_name)
+        else:
+            # If not found, check for partial match (fallback)
+            found = False
+            for var, official in variation_map.items():
+                if var in comp_lower or comp_lower in var:
+                    normalized.add(official)
+                    found = True
+                    break
+            
+            if not found:
+                # Keep original if no match (log warning)
+                logging.warning(f"   ⚠️ Unknown competitor variation: '{comp}' - keeping as-is")
+                normalized.add(comp)
+    
+    return ", ".join(sorted(normalized)) if normalized else '-'
 
 # ============================================================================
 # BUILD DYNAMIC PROMPT (SCRIPT 4 DETAILED VERSION)
@@ -752,6 +841,10 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     logging.info("STAGE 2: FULL ANALYSIS (Scraping + Deep Analysis)")
     logging.info("="*60)
     
+    # Load competitor variations from Excel
+    competitor_data = load_competitor_variations()
+    variation_map = competitor_data['variation_map']
+    
     # Filter for high relevance
     high_rel_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     
@@ -798,8 +891,12 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     
             analysis = full_analysis(title, content, relevance, full_prompt)
     
-            # Update dataframe with analysis results
-            df.at[idx, 'competitor_tagging'] = analysis['competitor_tagging']
+            # Normalize competitor names to official names using Excel mapping
+            raw_competitors = analysis.get('competitor_tagging', '-')
+            official_competitors = normalize_competitors_to_official(raw_competitors, variation_map)
+    
+            # Update dataframe with analysis results (using normalized competitor names)
+            df.at[idx, 'competitor_tagging'] = official_competitors
             df.at[idx, 'sbu_tagging'] = analysis['sbu_tagging']
             df.at[idx, 'category_tag'] = analysis['category_tag']
             df.at[idx, 'summary'] = analysis['summary']
@@ -807,8 +904,7 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
             df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
             df.at[idx, 'geography'] = analysis.get('geography')
     
-            time.sleep(RATE_LIMIT_DELAY)
-    
+            time.sleep(RATE_LIMIT_DELAY)    
     # Calculate ranking for all high-relevance articles
     logging.info(f"\n📊 Calculating ranking scores...")
     for idx, row in high_rel_df.iterrows():
