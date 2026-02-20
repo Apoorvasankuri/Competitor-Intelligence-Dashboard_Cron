@@ -1561,14 +1561,15 @@ def main():
     try:
         excel_data = load_excel_data()
         competitor_tier_map = load_competitor_tiers()
+        competitor_data = load_competitor_variations()
     except Exception as e:
         logging.error(f"❌ Failed to load Excel data: {e}")
         return
-
+    
     # Build dynamic prompt
     logging.info("\n🔧 Building enhanced analysis prompt...")
     full_prompt = build_full_analysis_prompt(
-        competitors=excel_data['competitors'],
+        competitors=competitor_data['official_names'],
         categories=excel_data['categories']
     )
     logging.info(f"   ✅ Prompt built with {len(excel_data['competitors'])} competitors and {len(excel_data['categories'])} categories")
