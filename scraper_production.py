@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 # Configuration
-LOOKBACK_DAYS = 1
+LOOKBACK_DAYS = 15
 MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests
 REQUEST_DELAY = 0.5  # Delay between requests in seconds
 EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
