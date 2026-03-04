@@ -118,7 +118,7 @@ def detect_competitor(title: str, source: str, competitor_to_sbu: Dict, competit
 async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int) -> Dict:
     """Asynchronously fetch RSS feed for a given keyword"""
     encoded_keyword = quote(keyword)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+when:{lookback_days}d&hl=en-IN&gl=IN&ceid=IN:en"
+    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+after:2026-02-25+before:2026-03-01&hl=en-IN&gl=IN&ceid=IN:en"
     
     try:
         # Use aiohttp to fetch the feed
