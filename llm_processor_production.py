@@ -31,7 +31,7 @@ if not CLAUDE_API_KEY:
 client = Anthropic(api_key=CLAUDE_API_KEY)
 
 # Model
-CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Excel mapping file
 EXCEL_MAPPING_FILE = "SBU_Competitor_Mapping.xlsx"
