@@ -9,20 +9,20 @@ if not DATABASE_URL:
 conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 cur = conn.cursor()
 
-cur.execute("DROP TABLE IF EXISTS results_new")
+cur.execute('DROP TABLE IF EXISTS "results_new_Sonnet_4_6"')
 cur.execute("""
-    CREATE TABLE "results_new_Sonnet 4.6" AS
-    SELECT * FROM processed_articles 
-    WHERE published_date >= '2026-02-25' 
+    CREATE TABLE "results_new_Sonnet_4_6" AS
+    SELECT * FROM processed_articles
+    WHERE published_date >= '2026-02-25'
     AND published_date <= '2026-02-28 23:59:59'
 """)
 
 conn.commit()
 
-cur.execute("SELECT COUNT(*) as cnt FROM results_new")
+cur.execute('SELECT COUNT(*) as cnt FROM "results_new_Sonnet_4_6"')
 count = cur.fetchone()['cnt']
 
-print(f"✅ Copied {count} rows to results_new table")
+print(f'✅ Copied {count} rows to results_new_Sonnet_4_6 table')
 
 cur.close()
 conn.close()
