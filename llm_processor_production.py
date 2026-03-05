@@ -74,7 +74,9 @@ def load_raw_articles() -> pd.DataFrame:
             link,
             content
         FROM raw_scraped_articles
+        WHERE published_date >= NOW() - INTERVAL '1 days'
         ORDER BY published_date DESC
+        LIMIT 500
     """
     
     cur = conn.cursor()
@@ -155,6 +157,9 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('rank_score', 0)
             ))
             conn.commit()
+            # Delete from raw after successful save
+            cur.execute("DELETE FROM raw_scraped_articles WHERE id = %s", (row.get('id'),))
+            conn.commit()
             cur.close()
             saved_count += 1
         except Exception as e:
@@ -168,24 +173,6 @@ def save_to_processed_articles(df: pd.DataFrame):
     if failed_count > 0:
         logging.warning(f"⚠️  Failed to save {failed_count} articles")
 
-
-def clear_raw_articles():
-    """Clear all records from raw_scraped_articles table"""
-    conn = get_db_connection()
-    
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM raw_scraped_articles")
-        deleted_count = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        logging.info(f"🗑️  Cleared {deleted_count} articles from raw_scraped_articles table")
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        logging.error(f"Error clearing raw_scraped_articles: {e}")
 
 
 # ============================================================================
@@ -1973,10 +1960,6 @@ def main():
     # Save to processed_articles table (only deduplicated high-relevance)
     logging.info("\n💾 Saving to processed_articles table...")
     save_to_processed_articles(high_relevance_df)
-
-    # Clear raw_scraped_articles table
-    logging.info("\n🧹 Clearing raw_scraped_articles table...")
-    clear_raw_articles()
 
     # Statistics
     elapsed = time.time() - start_time
