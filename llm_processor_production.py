@@ -37,8 +37,8 @@ CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
 EXCEL_MAPPING_FILE = "SBU_Competitor_Mapping.xlsx"
 
 # Performance Configuration
-STAGE1_BATCH_SIZE = 50
-STAGE2_BATCH_SIZE = 20
+STAGE1_BATCH_SIZE = 20
+STAGE2_BATCH_SIZE = 5
 MAX_WORKERS = 15
 RATE_LIMIT_DELAY = 0.15
 
@@ -653,7 +653,73 @@ SCORING RULES (0-100):
 - Competitor's unrelated businesses (IT services, finance, FMCG, retail)
 - Generic market/economy news with no sector specifics
 
-Return ONLY an integer 0-100. No explanation."""
+You will be given a batch of articles. For each, return ONLY its relevance score (0-100).
+Return a JSON array of objects with "id" and "score" fields. No explanation."""
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RateLimitError),
+    reraise=True
+)
+def batch_relevance_score(articles_batch: List[Dict]) -> List[int]:
+    """Score a batch of articles in a single API call."""
+    
+    articles_text = ""
+    for article in articles_batch:
+        articles_text += f"\n[{article['id']}] Title: {article['title']}\n    Competitor: {article['competitor']}\n"
+    
+    prompt = f"""Score these {len(articles_batch)} articles for relevance (0-100 each):
+{articles_text}
+
+Return ONLY a JSON array like: [{{"id": 1, "score": 85}}, {{"id": 2, "score": 30}}, ...]"""
+    
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=len(articles_batch) * 25,
+            temperature=0,
+            system=[
+                {
+                    "type": "text",
+                    "text": QUICK_SCORE_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        raw_response = response.content[0].text.strip()
+        
+        usage = response.usage
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+        cache_create = getattr(usage, 'cache_creation_input_tokens', 0)
+        if cache_read > 0:
+            logging.info(f"   💾 Cache HIT: {cache_read} tokens read from cache")
+        elif cache_create > 0:
+            logging.info(f"   💾 Cache WRITE: {cache_create} tokens written to cache")
+        
+        raw_response = re.sub(r'^```json\s*', '', raw_response)
+        raw_response = re.sub(r'^```\s*', '', raw_response)
+        raw_response = re.sub(r'\s*```$', '', raw_response)
+        
+        json_match = re.search(r'\[[\s\S]*\]', raw_response)
+        if json_match:
+            scores_list = json.loads(json_match.group(0))
+        else:
+            raise ValueError("No JSON array found in response")
+        
+        score_map = {}
+        for item in scores_list:
+            article_id = item.get('id')
+            score = int(item.get('score', 0))
+            score_map[article_id] = max(0, min(100, score))
+        
+        return [score_map.get(article['id'], 0) for article in articles_batch]
+        
+    except Exception as e:
+        logging.warning(f"Batch scoring failed: {e}")
+        return [0] * len(articles_batch)
 
 
 @retry(
@@ -662,31 +728,111 @@ Return ONLY an integer 0-100. No explanation."""
     retry=retry_if_exception_type(RateLimitError),
     reraise=True
 )
-def quick_relevance_score(title: str, competitor: str) -> int:
-    """Quick relevance scoring using title only"""
+def batch_full_analysis(articles_batch: List[Dict], full_prompt: str) -> List[Dict]:
+    """Analyze a batch of articles in a single API call."""
     
-    prompt = f"""Title: {title}
-Competitor: {competitor}
+    articles_text = ""
+    for i, article in enumerate(articles_batch):
+        content = article['content'][:2000] if article['content'] else article['title']
+        articles_text += f"""
+--- ARTICLE {i+1} (relevance: {article['relevance_score']}/100) ---
+Title: {article['title']}
+Content: {content}
+"""
+    
+    prompt = f"""Analyze these {len(articles_batch)} articles. For EACH article, provide the full analysis.
 
-Relevance score (0-100):"""
+{articles_text}
+
+Return a JSON array with one object per article (in the same order), each containing:
+competitor_tagging, sbu_tagging, category_tag, summary, contract_value_inr_crore, geography
+
+Example format:
+[
+  {{"competitor_tagging": "L&T", "sbu_tagging": "India T&D", "category_tag": "order wins", "summary": "...", "contract_value_inr_crore": 1200, "geography": "India"}},
+  {{"competitor_tagging": "Kalpataru", "sbu_tagging": "Renewables", "category_tag": "financial", "summary": "...", "contract_value_inr_crore": null, "geography": null}}
+]
+
+Return ONLY the JSON array, no other text."""
     
     try:
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=10,
+            max_tokens=len(articles_batch) * 300,
             temperature=0,
-            system=QUICK_SCORE_PROMPT,
+            system=[
+                {
+                    "type": "text",
+                    "text": full_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             messages=[{"role": "user", "content": prompt}]
         )
         
-        score_text = response.content[0].text.strip()
-        score = int(re.search(r'\d+', score_text).group())
-        return max(0, min(100, score))
+        raw_response = response.content[0].text.strip()
+        
+        usage = response.usage
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+        cache_create = getattr(usage, 'cache_creation_input_tokens', 0)
+        if cache_read > 0:
+            logging.info(f"   💾 Cache HIT: {cache_read} tokens read from cache")
+        elif cache_create > 0:
+            logging.info(f"   💾 Cache WRITE: {cache_create} tokens written to cache")
+        
+        raw_response = re.sub(r'^```json\s*', '', raw_response)
+        raw_response = re.sub(r'^```\s*', '', raw_response)
+        raw_response = re.sub(r'\s*```$', '', raw_response)
+        
+        json_match = re.search(r'\[[\s\S]*\]', raw_response)
+        if json_match:
+            analyses = json.loads(json_match.group(0))
+        else:
+            raise ValueError("No JSON array found in response")
+        
+        results = []
+        for i, analysis in enumerate(analyses):
+            if i < len(articles_batch):
+                analysis['relevance_score'] = articles_batch[i]['relevance_score']
+            
+            required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary", "contract_value_inr_crore", "geography"]
+            for field in required:
+                if field not in analysis:
+                    analysis[field] = None if field in ['contract_value_inr_crore', 'geography'] else '-'
+            
+            if analysis.get('contract_value_inr_crore') is not None:
+                try:
+                    analysis['contract_value_inr_crore'] = float(analysis['contract_value_inr_crore'])
+                except:
+                    analysis['contract_value_inr_crore'] = None
+            
+            results.append(analysis)
+        
+        while len(results) < len(articles_batch):
+            idx = len(results)
+            results.append({
+                "relevance_score": articles_batch[idx]['relevance_score'] if idx < len(articles_batch) else 0,
+                "competitor_tagging": "-",
+                "sbu_tagging": "None",
+                "category_tag": "error",
+                "summary": "Batch analysis incomplete",
+                "contract_value_inr_crore": None,
+                "geography": None
+            })
+        
+        return results
         
     except Exception as e:
-        logging.warning(f"Quick score failed for '{title[:50]}...': {e}")
-        return 0
-
+        logging.error(f"Batch analysis failed: {e}")
+        return [{
+            "relevance_score": article.get('relevance_score', 0),
+            "competitor_tagging": "-",
+            "sbu_tagging": "None",
+            "category_tag": "error",
+            "summary": f"Batch analysis error: {str(e)[:80]}",
+            "contract_value_inr_crore": None,
+            "geography": None
+        } for article in articles_batch]
 
 # ============================================================================
 # STAGE 2: FULL ANALYSIS
@@ -793,34 +939,47 @@ Provide detailed analysis."""
 # ============================================================================
 
 def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
-    """Stage 1: Quick relevance scoring for all articles"""
+    """Stage 1: Batched relevance scoring."""
     
     logging.info("\n" + "="*60)
-    logging.info("STAGE 1: QUICK RELEVANCE SCORING (Title Only)")
+    logging.info("STAGE 1: BATCHED RELEVANCE SCORING (Optimized)")
+    logging.info(f"  Batch size: {STAGE1_BATCH_SIZE} articles per API call")
     logging.info("="*60)
     
-    relevance_scores = []
+    relevance_scores = [0] * len(df)
     total = len(df)
+    total_batches = (total + STAGE1_BATCH_SIZE - 1) // STAGE1_BATCH_SIZE
     
+    # Prepare all batches
+    all_batches = []
     for i in range(0, total, STAGE1_BATCH_SIZE):
-        batch_num = i // STAGE1_BATCH_SIZE + 1
-        total_batches = (total + STAGE1_BATCH_SIZE - 1) // STAGE1_BATCH_SIZE
-        
         batch_df = df.iloc[i:i+STAGE1_BATCH_SIZE]
-        
-        logging.info(f"\n📊 Scoring batch {batch_num}/{total_batches} ({len(batch_df)} articles)...")
-        
-        for idx, row in batch_df.iterrows():
-            title = str(row['News Title'])
-            competitor = str(row.get('Competitor', ''))
-            
-            score = quick_relevance_score(title, competitor)
-            relevance_scores.append(score)
-            
-            if score >= RELEVANCE_THRESHOLD:
-                logging.info(f"   ✅ Score {score}: {title[:60]}...")
-            
-            time.sleep(RATE_LIMIT_DELAY)
+        articles_batch = []
+        for local_idx, (df_idx, row) in enumerate(batch_df.iterrows()):
+            articles_batch.append({
+                'id': local_idx + 1,
+                'title': str(row['News Title']),
+                'competitor': str(row.get('Competitor', ''))
+            })
+        all_batches.append((i, articles_batch))
+    
+    # Run batches in parallel (4 concurrent)
+    logging.info(f"📊 Scoring {len(all_batches)} batches (4 concurrent)...")
+    
+    def score_batch(batch_tuple):
+        start_idx, articles_batch = batch_tuple
+        return start_idx, batch_relevance_score(articles_batch)
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(score_batch, b): b for b in all_batches}
+        for future in as_completed(futures):
+            start_idx, batch_scores = future.result()
+            batch_df = df.iloc[start_idx:start_idx+STAGE1_BATCH_SIZE]
+            for j, score in enumerate(batch_scores):
+                relevance_scores[start_idx + j] = score
+                if score >= RELEVANCE_THRESHOLD:
+                    title = str(batch_df.iloc[j]['News Title'])
+                    logging.info(f"   ✅ Score {score}: {title[:60]}...")
     
     df['relevance_score'] = relevance_scores
     
@@ -828,31 +987,30 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
     
     logging.info(f"\n📈 Stage 1 Complete:")
     logging.info(f"   Total articles: {len(df)}")
+    logging.info(f"   API calls made: {total_batches} (was {len(df)} before optimization)")
     logging.info(f"   High relevance (≥{RELEVANCE_THRESHOLD}): {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
     logging.info(f"   Will proceed to full analysis: {len(high_relevance)} articles")
     
     return df
 
-
 def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map: Dict[str, int]) -> pd.DataFrame:
-    """Stage 2: Full analysis only for high-relevance articles"""
+    """Stage 2: Batched full analysis with prompt caching."""
     
     logging.info("\n" + "="*60)
-    logging.info("STAGE 2: FULL ANALYSIS (Scraping + Deep Analysis)")
+    logging.info("STAGE 2: BATCHED FULL ANALYSIS (Optimized)")
+    logging.info(f"  Batch size: {STAGE2_BATCH_SIZE} articles per API call")
+    logging.info(f"  System prompt caching: ENABLED")
     logging.info("="*60)
     
-    # Load competitor variations from Excel
     competitor_data = load_competitor_variations()
     variation_map = competitor_data['variation_map']
     
-    # Filter for high relevance
     high_rel_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     
     if len(high_rel_df) == 0:
         logging.warning("No articles meet relevance threshold. Skipping Stage 2.")
         return df
     
-    # Initialize columns for all rows
     df['competitor_tagging'] = '-'
     df['sbu_tagging'] = 'None'
     df['category_tag'] = 'not_analyzed'
@@ -860,64 +1018,73 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     df['scraped_content'] = ''
     
     total = len(high_rel_df)
+    total_batches = (total + STAGE2_BATCH_SIZE - 1) // STAGE2_BATCH_SIZE
     
+    logging.info(f"\n📥 Scraping {total} articles in parallel...")
+    contents = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(scrape_article, row['Link']): idx
+            for idx, row in high_rel_df.iterrows()
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            contents[idx] = future.result()
+    
+    logging.info(f"   ✅ Scraped {len(contents)} articles")
+    
+    high_rel_indices = list(high_rel_df.index)
+    
+    # Prepare all batches
+    all_batches = []
     for i in range(0, total, STAGE2_BATCH_SIZE):
-        batch_num = i // STAGE2_BATCH_SIZE + 1
-        total_batches = (total + STAGE2_BATCH_SIZE - 1) // STAGE2_BATCH_SIZE
-        
-        batch_df = high_rel_df.iloc[i:i+STAGE2_BATCH_SIZE]
-        
-        logging.info(f"\n🔍 Analyzing batch {batch_num}/{total_batches} ({len(batch_df)} articles)...")
-        
-        # Parallel scraping
-        logging.info(f"   📥 Scraping {len(batch_df)} articles...")
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_idx = {
-                executor.submit(scrape_article, row['Link']): idx
-                for idx, row in batch_df.iterrows()
-            }
-            
-            contents = {}
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                contents[idx] = future.result()
-        
-        # Sequential analysis
-        logging.info(f"   🤖 Running full analysis...")
-        for idx, row in batch_df.iterrows():
-            title = str(row['News Title'])
-            content = contents.get(idx, '')
-            relevance = row['relevance_score']
+        batch_indices = high_rel_indices[i:i+STAGE2_BATCH_SIZE]
+        articles_batch = []
+        for idx in batch_indices:
+            row = df.loc[idx]
+            articles_batch.append({
+                'title': str(row['News Title']),
+                'content': contents.get(idx, ''),
+                'relevance_score': row['relevance_score']
+            })
+        all_batches.append((batch_indices, articles_batch))
     
-            analysis = full_analysis(title, content, relevance, full_prompt)
+    # Run batches in parallel (3 concurrent)
+    logging.info(f"🔍 Analyzing {len(all_batches)} batches (3 concurrent)...")
     
-            # Normalize competitor names to official names using Excel mapping
-            raw_competitors = analysis.get('competitor_tagging', '-')
-            official_competitors = normalize_competitors_to_official(raw_competitors, variation_map)
+    def analyze_batch(batch_tuple):
+        batch_indices, articles_batch = batch_tuple
+        return batch_indices, batch_full_analysis(articles_batch, full_prompt)
     
-            # Update dataframe with analysis results (using normalized competitor names)
-            df.at[idx, 'competitor_tagging'] = official_competitors
-            df.at[idx, 'sbu_tagging'] = analysis['sbu_tagging']
-            df.at[idx, 'category_tag'] = analysis['category_tag']
-            df.at[idx, 'summary'] = analysis['summary']
-            df.at[idx, 'scraped_content'] = content[:500] if content else ''
-            df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
-            df.at[idx, 'geography'] = analysis.get('geography')
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(analyze_batch, b): b for b in all_batches}
+        for future in as_completed(futures):
+            batch_indices, batch_results = future.result()
+            for j, (idx, analysis) in enumerate(zip(batch_indices, batch_results)):
+                raw_competitors = analysis.get('competitor_tagging', '-')
+                official_competitors = normalize_competitors_to_official(raw_competitors, variation_map)
+                
+                df.at[idx, 'competitor_tagging'] = official_competitors
+                df.at[idx, 'sbu_tagging'] = analysis.get('sbu_tagging', 'None')
+                df.at[idx, 'category_tag'] = analysis.get('category_tag', 'not_analyzed')
+                df.at[idx, 'summary'] = analysis.get('summary', '')
+                df.at[idx, 'scraped_content'] = (contents.get(idx, ''))[:500]
+                df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
+                df.at[idx, 'geography'] = analysis.get('geography')
     
-            time.sleep(RATE_LIMIT_DELAY)    
-    # Calculate ranking for all high-relevance articles
     logging.info(f"\n📊 Calculating ranking scores...")
-    for idx, row in high_rel_df.iterrows():
+    for idx in high_rel_indices:
         rank_data = calculate_rank_score(df.loc[idx], competitor_tier_map)
         df.at[idx, 'rank_score'] = rank_data['rank_score']
         df.at[idx, 'competitor_tier'] = rank_data['competitor_tier']
         
         logging.info(f"   Rank {rank_data['rank_score']}: {df.loc[idx, 'News Title'][:60]}...")
     
-    logging.info(f"\n✅ Stage 2 Complete: Analyzed {len(high_rel_df)} high-relevance articles")
+    logging.info(f"\n✅ Stage 2 Complete:")
+    logging.info(f"   Articles analyzed: {len(high_rel_df)}")
+    logging.info(f"   API calls made: {total_batches} (was {len(high_rel_df)} before optimization)")
     
     return df
-
 
 # ============================================================================
 # DEDUPLICATION - PHASE 1: STRING-BASED (FAST)
@@ -1133,7 +1300,13 @@ Rules:
             model=CLAUDE_MODEL,
             max_tokens=300,
             temperature=0,
-            system=FINGERPRINT_SYSTEM_PROMPT,
+            system=[
+                {
+                    "type": "text",
+                    "text": FINGERPRINT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             messages=[{"role": "user", "content": prompt}]
         )
 
