@@ -341,7 +341,7 @@ def normalize_competitors_to_official(competitor_string: str, variation_map: dic
 # BUILD DYNAMIC PROMPT (SCRIPT 4 DETAILED VERSION)
 # ============================================================================
 
-def build_full_analysis_prompt(competitors: List[str], categories: List[str]) -> str:
+def build_full_analysis_prompt(categories: List[str]) -> str:
     """Build the full analysis prompt with dynamic data"""
     
     # Format categories list with numbering
@@ -560,31 +560,6 @@ RULES:
 - Apply prioritization rules
 - Focus on the PRIMARY business action in the article
 
-**4. SUMMARY**
-RULES:
-- Write EXACTLY 1-2 sentences (maximum 40 words total)
-- Be crisp and fact-dense - every word must add value
-- MUST include: Competitor name, key numbers (contract value/revenue/percentage), specific action related to category
-- Structure: "[Competitor] [action verb] [key number] [what/where] [category-specific detail]"
-- NO generic phrases like "strengthening position" or "demonstrates dominance"
-- Focus on FACTS, not implications
-
-GOOD SUMMARY EXAMPLES:
-✓ "L&T secured ₹850 crore contract for 220 kV transmission line in Uttar Pradesh, including 45 km overhead lines and 2 substations." (ORDER WIN - 24 words)
-✓ "Kalpataru's Q4 revenue grew 22% to ₹4,200 crore with order book at ₹28,000 crore in T&D and urban infrastructure." (FINANCIAL - 22 words)
-✓ "L&T, Tata Projects, Kalpataru, and Sterlite bid for PGCIL's ₹600 crore 400 kV Bikaner-Merta transmission project." (BIDDING - 17 words)
-
-BAD SUMMARY EXAMPLES:
-✗ "L&T secured a major contract, strengthening its position in India's grid expansion market where KEC also competes. This win demonstrates L&T's continued dominance in state utility projects." (too wordy, no specific details, 30 words)
-✗ "The company won a project. This is good for them." (too vague, 9 words)
-✗ "Kalpataru Power Transmission achieved impressive growth in the latest quarter, demonstrating strong operational efficiency and market traction across various business segments in competitive markets." (too generic, no numbers, 27 words)
-
-CATEGORY-SPECIFIC REQUIREMENTS:
-- ORDER WINS: Include contract value, scope (km/MW/stations), location
-- FINANCIAL: Include revenue/profit figures, growth %, order book value
-- BIDDING: List all competitors bidding, project value, scope
-- PROJECT EXECUTION: Include capacity/scale, timeline, location
-- M&A/PARTNERSHIPS: Include deal value, stake %, target company details
 ====================
 OUTPUT FORMAT
 ====================
@@ -594,7 +569,6 @@ Return ONLY valid JSON with these exact field names:
   "competitor_tagging": "<comma-separated competitor names from list, or '-'>",
   "sbu_tagging": "<comma-separated SBU names from list, or 'General'>",
   "category_tag": "<single category from list>",
-  "summary": "<1-2 sentences, max 40 words with specific numbers>",
   "contract_value_inr_crore": <numeric value in INR crore, or null if not mentioned>,
   "geography": "<India/Middle East/Africa/Americas/SAARC/Other or null>"
 }}
@@ -634,7 +608,6 @@ CORRECT OUTPUT:
   "competitor_tagging": "L&T",
   "sbu_tagging": "Transportation",
   "category_tag": "order wins",
-  "summary": "L&T won ₹1,200 crore Pune Metro Line 4 contract covering 8 elevated stations and 12 km viaduct with 36-month timeline.",
   "contract_value_inr_crore": 1200,
   "geography": "India"
 }}
@@ -649,7 +622,6 @@ CORRECT OUTPUT:
   "competitor_tagging": "L&T, Tata Projects, Kalpataru, Sterlite",
   "sbu_tagging": "India T&D",
   "category_tag": "bidding activity",
-  "summary": "L&T, Tata Projects, Kalpataru, Sterlite competing for PGCIL's ₹600 crore 400 kV Bikaner-Merta transmission line.",
   "contract_value_inr_crore": 600,
   "geography": "India"
 }}
@@ -664,7 +636,6 @@ CORRECT OUTPUT:
   "competitor_tagging": "Kalpataru",
   "sbu_tagging": "General",
   "category_tag": "financial",
-  "summary": "Kalpataru Q4 revenue up 22% to ₹4,200 crore, order book ₹28,000 crore in T&D and urban infrastructure, margins 8.2%.",
   "contract_value_inr_crore": 4200,
   "geography": null
 }}
@@ -803,12 +774,12 @@ Content: {content}
 {articles_text}
 
 Return a JSON array with one object per article (in the same order), each containing:
-competitor_tagging, sbu_tagging, category_tag, summary, contract_value_inr_crore, geography
+competitor_tagging, sbu_tagging, category_tag, contract_value_inr_crore, geography
 
 Example format:
 [
-  {{"competitor_tagging": "L&T", "sbu_tagging": "India T&D", "category_tag": "order wins", "summary": "...", "contract_value_inr_crore": 1200, "geography": "India"}},
-  {{"competitor_tagging": "Kalpataru", "sbu_tagging": "Renewables", "category_tag": "financial", "summary": "...", "contract_value_inr_crore": null, "geography": null}}
+  {{"competitor_tagging": "L&T", "sbu_tagging": "India T&D", "category_tag": "order wins", "...", "contract_value_inr_crore": 1200, "geography": "India"}},
+  {{"competitor_tagging": "Kalpataru", "sbu_tagging": "Renewables", "category_tag": "financial", "...", "contract_value_inr_crore": null, "geography": null}}
 ]
 
 Return ONLY the JSON array, no other text."""
@@ -853,7 +824,7 @@ Return ONLY the JSON array, no other text."""
             if i < len(articles_batch):
                 analysis['relevance_score'] = articles_batch[i]['relevance_score']
             
-            required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary", "contract_value_inr_crore", "geography"]
+            required = ["competitor_tagging", "sbu_tagging", "category_tag", "contract_value_inr_crore", "geography"]
             for field in required:
                 if field not in analysis:
                     analysis[field] = None if field in ['contract_value_inr_crore', 'geography'] else '-'
@@ -873,7 +844,6 @@ Return ONLY the JSON array, no other text."""
                 "competitor_tagging": "-",
                 "sbu_tagging": "None",
                 "category_tag": "error",
-                "summary": "Batch analysis incomplete",
                 "contract_value_inr_crore": None,
                 "geography": None
             })
@@ -887,7 +857,6 @@ Return ONLY the JSON array, no other text."""
             "competitor_tagging": "-",
             "sbu_tagging": "None",
             "category_tag": "error",
-            "summary": f"Batch analysis error: {str(e)[:80]}",
             "contract_value_inr_crore": None,
             "geography": None
         } for article in articles_batch]
@@ -967,7 +936,7 @@ Provide detailed analysis."""
         analysis['relevance_score'] = relevance_score
         
         # Validate
-        required = ["competitor_tagging", "sbu_tagging", "category_tag", "summary", "contract_value_inr_crore", "geography"]
+        required = ["competitor_tagging", "sbu_tagging", "category_tag", "contract_value_inr_crore", "geography"
         for field in required:
             if field not in analysis:
                 raise ValueError(f"Missing field: {field}")
@@ -1125,7 +1094,6 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
                 df.at[idx, 'competitor_tagging'] = official_competitors
                 df.at[idx, 'sbu_tagging'] = analysis.get('sbu_tagging', 'None')
                 df.at[idx, 'category_tag'] = analysis.get('category_tag', 'not_analyzed')
-                df.at[idx, 'summary'] = analysis.get('summary', '')
                 df.at[idx, 'scraped_content'] = (contents.get(idx, ''))[:500]
                 df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
                 df.at[idx, 'geography'] = analysis.get('geography')
@@ -1525,6 +1493,8 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
 
         logging.info(f"   [{idx+1}/{len(df_reset)}] {title[:60]}...")
         time.sleep(RATE_LIMIT_DELAY)
+    # Store fingerprints on DataFrame for later summary generation
+    df_reset['_fingerprint'] = df_reset.index.map(lambda i: fingerprints.get(i, {}))
 
     # Step 3: Group by competitor, compare fingerprints within each group
     logging.info("\n   🔍 Comparing fingerprints within competitor groups...")
@@ -1632,6 +1602,188 @@ def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
 
     logging.info(f"\n✅ Dedup complete: {initial_count} → {after_phase2} articles ({initial_count - after_phase2} total removed)")
 
+    return df
+
+def generate_summaries_from_fingerprints(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate summaries programmatically from stored fingerprints + analysis results.
+    No API calls needed — purely deterministic.
+    """
+    logging.info("\n📝 Generating summaries from fingerprints...")
+
+    summary_count = 0
+
+    for idx, row in df.iterrows():
+        fp = row.get('_fingerprint', {})
+        if not fp or not isinstance(fp, dict):
+            df.at[idx, 'summary'] = str(row.get('News Title', ''))
+            continue
+
+        category = str(row.get('category_tag', '')).lower()
+        competitor = str(row.get('competitor_tagging', '-'))
+        sbu = str(row.get('sbu_tagging', 'General'))
+        geography = str(row.get('geography', '')) if pd.notna(row.get('geography')) else ''
+        contract_value = row.get('contract_value_inr_crore')
+
+        # Build summary based on category
+        parts = []
+
+        if category == 'order wins':
+            company = fp.get('company') or competitor
+            value = fp.get('contract_value_crore') or contract_value
+            scope = fp.get('scope') or ''
+            location = fp.get('location') or geography
+            client = fp.get('client_or_authority') or ''
+
+            parts.append(f"{company} secured")
+            if value:
+                parts.append(f"₹{value} crore")
+            if client:
+                parts.append(f"contract from {client}")
+            else:
+                parts.append("contract")
+            if scope:
+                parts.append(f"for {scope}")
+            if location:
+                parts.append(f"in {location}")
+
+        elif category == 'bidding activity':
+            companies = fp.get('companies_bidding') or competitor
+            value = fp.get('project_value_crore') or contract_value
+            scope = fp.get('scope') or ''
+            client = fp.get('client_or_authority') or ''
+            location = fp.get('location') or geography
+
+            parts.append(f"{companies} competing for")
+            if client:
+                parts.append(f"{client}'s")
+            if value:
+                parts.append(f"₹{value} crore")
+            if scope:
+                parts.append(f"{scope} project")
+            else:
+                parts.append("project")
+            if location:
+                parts.append(f"in {location}")
+
+        elif category == 'financial':
+            company = fp.get('company') or competitor
+            period = fp.get('period') or ''
+            revenue = fp.get('revenue_crore')
+            profit = fp.get('profit_crore')
+            order_book = fp.get('order_book_crore')
+
+            parts.append(f"{company}")
+            if period:
+                parts.append(f"{period}")
+            if revenue:
+                parts.append(f"revenue ₹{revenue} crore")
+            if profit:
+                parts.append(f"profit ₹{profit} crore")
+            if order_book:
+                parts.append(f"order book ₹{order_book} crore")
+
+        elif category == 'project execution':
+            company = fp.get('company') or competitor
+            project = fp.get('project_name') or ''
+            scale = fp.get('capacity_or_scale') or ''
+            location = fp.get('location') or geography
+            milestone = fp.get('milestone') or ''
+
+            parts.append(f"{company}")
+            if milestone:
+                parts.append(f"{milestone}")
+            if project:
+                parts.append(f"{project}")
+            if scale:
+                parts.append(f"({scale})")
+            if location:
+                parts.append(f"in {location}")
+
+        elif category == 'mergers & acquisitions':
+            acquirer = fp.get('acquirer') or competitor
+            target = fp.get('target_company') or ''
+            value = fp.get('deal_value_crore') or contract_value
+            stake = fp.get('stake_percent') or ''
+
+            parts.append(f"{acquirer}")
+            if target:
+                parts.append(f"acquiring {target}")
+            if stake:
+                parts.append(f"({stake}% stake)")
+            if value:
+                parts.append(f"for ₹{value} crore")
+
+        elif category == 'partnerships & alliances':
+            companies = fp.get('companies_involved') or competitor
+            deal_type = fp.get('deal_type') or 'partnership'
+            sector = fp.get('sector') or sbu
+            value = fp.get('value_crore') or contract_value
+
+            parts.append(f"{companies} formed {deal_type}")
+            if sector:
+                parts.append(f"in {sector}")
+            if value:
+                parts.append(f"worth ₹{value} crore")
+
+        elif category == 'stock market':
+            company = fp.get('company') or competitor
+            movement = fp.get('price_movement_percent') or ''
+            trigger = fp.get('trigger_event') or ''
+
+            parts.append(f"{company} stock")
+            if movement:
+                parts.append(f"moved {movement}%")
+            if trigger:
+                parts.append(f"on {trigger}")
+
+        elif category == 'regulatory & policy':
+            authority = fp.get('authority') or ''
+            policy = fp.get('policy_or_rule') or ''
+            sector = fp.get('sector_affected') or sbu
+
+            if authority:
+                parts.append(f"{authority}")
+            if policy:
+                parts.append(f"announced {policy}")
+            if sector:
+                parts.append(f"affecting {sector}")
+
+        elif category == 'industry trends':
+            topic = fp.get('topic') or ''
+            stat = fp.get('key_stat') or ''
+            geo = fp.get('geography') or geography
+
+            if topic:
+                parts.append(f"{topic}")
+            if stat:
+                parts.append(f"— {stat}")
+            if geo:
+                parts.append(f"in {geo}")
+
+        else:
+            # Fallback: use title
+            parts.append(str(row.get('News Title', '')))
+
+        summary = ' '.join(parts).strip()
+
+        # Fallback if summary is too short or empty
+        if len(summary) < 15:
+            summary = str(row.get('News Title', ''))
+
+        # Truncate if too long (max ~60 words)
+        words = summary.split()
+        if len(words) > 60:
+            summary = ' '.join(words[:60]) + '.'
+
+        # Ensure it ends with a period
+        if summary and not summary.endswith('.'):
+            summary += '.'
+
+        df.at[idx, 'summary'] = summary
+        summary_count += 1
+
+    logging.info(f"   ✅ Generated {summary_count} summaries (0 API calls)")
     return df
 
 
@@ -1814,6 +1966,10 @@ def main():
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     if len(high_relevance_df) > 0:
         high_relevance_df = deduplicate_articles(high_relevance_df)
+        high_relevance_df = generate_summaries_from_fingerprints(high_relevance_df)
+        high_relevance_df = high_relevance_df.drop(columns=['_fingerprint'], errors='ignore')
+
+    # Save to processed_articles table (only deduplicated high-relevance)
 
     # Save to processed_articles table (only deduplicated high-relevance)
     logging.info("\n💾 Saving to processed_articles table...")
