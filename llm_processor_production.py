@@ -778,8 +778,8 @@ competitor_tagging, sbu_tagging, category_tag, contract_value_inr_crore, geograp
 
 Example format:
 [
-  {{"competitor_tagging": "L&T", "sbu_tagging": "India T&D", "category_tag": "order wins", "...", "contract_value_inr_crore": 1200, "geography": "India"}},
-  {{"competitor_tagging": "Kalpataru", "sbu_tagging": "Renewables", "category_tag": "financial", "...", "contract_value_inr_crore": null, "geography": null}}
+  {{"competitor_tagging": "L&T", "sbu_tagging": "India T&D", "category_tag": "order wins", "contract_value_inr_crore": 1200, "geography": "India"}},
+  {{"competitor_tagging": "Kalpataru", "sbu_tagging": "Renewables", "category_tag": "financial", "contract_value_inr_crore": null, "geography": null}}
 ]
 
 Return ONLY the JSON array, no other text."""
@@ -936,7 +936,7 @@ Provide detailed analysis."""
         analysis['relevance_score'] = relevance_score
         
         # Validate
-        required = ["competitor_tagging", "sbu_tagging", "category_tag", "contract_value_inr_crore", "geography"
+        required = ["competitor_tagging", "sbu_tagging", "category_tag", "contract_value_inr_crore", "geography"]
         for field in required:
             if field not in analysis:
                 raise ValueError(f"Missing field: {field}")
@@ -956,8 +956,7 @@ Provide detailed analysis."""
             "relevance_score": relevance_score,
             "competitor_tagging": "-",
             "sbu_tagging": "None",
-            "category_tag": "error",
-            "summary": f"Analysis error: {str(e)[:100]}"
+            "category_tag": "error"
         }
 
 
