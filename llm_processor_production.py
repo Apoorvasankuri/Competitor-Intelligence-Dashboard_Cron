@@ -679,7 +679,6 @@ Return ONLY a JSON array like: [{{"id": 1, "score": 85}}, {{"id": 2, "score": 30
             model=CLAUDE_MODEL,
             max_tokens=len(articles_batch) * 25,
             temperature=0,
-            effort="low",
             system=[
                 {
                     "type": "text",
@@ -1301,7 +1300,6 @@ Rules:
             model=CLAUDE_MODEL,
             max_tokens=300,
             temperature=0,
-            effort="low",
             system=[
                 {
                     "type": "text",
