@@ -11,7 +11,7 @@ cur = conn.cursor()
 
 cur.execute("DROP TABLE IF EXISTS results_new")
 cur.execute("""
-    CREATE TABLE results_new AS
+    CREATE TABLE results_new_Sonnet 4.6 AS
     SELECT * FROM processed_articles 
     WHERE published_date >= '2026-02-25' 
     AND published_date <= '2026-02-28 23:59:59'
