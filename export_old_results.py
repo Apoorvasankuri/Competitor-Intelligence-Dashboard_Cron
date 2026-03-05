@@ -24,15 +24,26 @@ conn.close()
 df = pd.DataFrame(results)
 csv_string = df.to_csv(index=False)
 
-response = requests.post(
-    "https://file.io",
-    files={"file": ("results_new.csv", csv_string, "text/csv")}
+# Try transfer.sh
+response = requests.put(
+    "https://transfer.sh/results_new.csv",
+    data=csv_string.encode('utf-8'),
+    headers={"Content-Type": "text/csv"}
 )
 
 if response.status_code == 200:
-    data = response.json()
     print(f"✅ Exported {len(df)} rows")
-    print(f"📥 Download link: {data.get('link')}")
-    print(f"⚠️  Link works ONCE — download immediately!")
+    print(f"📥 Download link: {response.text.strip()}")
 else:
-    print(f"❌ Upload failed: {response.text}")
+    # Fallback: try 0x0.st
+    response2 = requests.post(
+        "https://0x0.st",
+        files={"file": ("results_new.csv", csv_string.encode('utf-8'), "text/csv")}
+    )
+    if response2.status_code == 200:
+        print(f"✅ Exported {len(df)} rows")
+        print(f"📥 Download link: {response2.text.strip()}")
+    else:
+        print(f"❌ All uploads failed")
+        print(f"Transfer.sh: {response.status_code} - {response.text[:200]}")
+        print(f"0x0.st: {response2.status_code} - {response2.text[:200]}")
