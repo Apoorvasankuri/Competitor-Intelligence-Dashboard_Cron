@@ -344,9 +344,6 @@ def normalize_competitors_to_official(competitor_string: str, variation_map: dic
 def build_full_analysis_prompt(competitors: List[str], categories: List[str]) -> str:
     """Build the full analysis prompt with dynamic data"""
     
-    # Format competitors list
-    competitors_text = "\n".join([f"- {comp}" for comp in competitors])
-    
     # Format categories list with numbering
     categories_text = "\n".join([f"{i+1}. **{cat}**" for i, cat in enumerate(categories)])
     
@@ -410,30 +407,91 @@ KEC operates through six main business verticals (SBUs):
    - Conductors (overhead line conductors)
    - Telecom cables
    - Special application cables
-
 ====================
 COMPETITORS LIST
 ====================
-Use ONLY these competitor names from our database:
+Below are KEC's competitors. Use FUZZY MATCHING to recognize abbreviations, acronyms, partial names, and common variations (e.g. "L&T" → "Larsen & Toubro Limited", "KPTL" → "Kalpataru Projects International Limited", "HCC" → "Hindustan Construction Company Limited", "RVNL" → "Rail Vikas Nigam Limited").
 
-{competitors_text}
+Always return the FULL OFFICIAL NAME exactly as listed below:
 
-**VARIATION RECOGNITION:**
-Recognize variations and map to the standard name above:
-- "L&T" = "Larsen & Toubro" = "Larsen and Toubro" = "L&T Ltd" = "L&T Limited"
-- "Tata Projects" = "Tata Projects Ltd" = "Tata Projects Limited"
-- "Kalpataru" = "Kalpataru Power Transmission" = "Kalpataru Projects International" = "KPTL"
-- "ABB" = "ABB India" = "ABB Limited" = "ABB Ltd"
-- "Siemens" = "Siemens India" = "Siemens Limited" = "Siemens AG"
-- "IRCON" = "IRCON International" = "IRCON International Ltd"
-- "RVNL" = "Rail Vikas Nigam" = "Rail Vikas Nigam Limited"
-- "Sterling & Wilson" = "Sterling and Wilson" = "S&W"
-- "Sterlite" = "Sterlite Power" = "Sterlite Grid"
-
-**SUBSIDIARY MAPPING:**
-Map subsidiaries to parent company ONLY if doing EPC/infrastructure work:
-- "L&T Construction" / "L&T Power" / "L&T Metro" → "L&T"
-- "Tata Power" doing EPC → "Tata Projects", otherwise "-"
+- AFCONS Infrastructure Limited
+- Ace Pipeline Contracts Private Limited
+- Advance Infrastructures Pvt Ltd
+- Ahluwalia Contracts (India) Limited
+- Al Fanar Group
+- Al Sharif Group Holding
+- Algihaz Holdings
+- Amara Raja Group
+- Ashoka Buildcon Limited
+- Bajaj Electricals Limited
+- Bajel Projects Limited
+- Bondada Engineering Limited
+- Bridge & Roof Company(India) Limited
+- CMEC (China)
+- China Southern Power Grid Company Limited
+- Corrtech International Limited
+- Dilip Buildcon Limited
+- Dineshchandra R. Agrawal Infracon Private Limited
+- EnProCon Enterprise Limited
+- Essens Renewable Private Limited
+- Ever Renew Energy Pvt. Ltd.
+- Everrenew Energy Private Limited
+- GR Infraprojects Limited
+- H.G. Infra Engineering Limited
+- Hartek Group
+- Hindustan Construction Company Limited
+- Hitachi Energy India Limited
+- Hyosung T&D India Private Limited
+- Hyundai Engineering & Construction Co.
+- IRCON International Limited
+- ISC Projects Private Limited
+- J. Kumar Infraprojects Limited
+- JSIW Infrastructure Private Limited
+- Jackson Electricals & Infrastructure Pvt. Ltd.
+- Jackson Green Energy
+- Jyoti Structures Limited
+- KP Energy Ltd
+- KPI Green Energy Limited
+- Kalpataru Projects International Limited
+- Kernex Microsystems Private Limited
+- Kintech-Synergy
+- Kiran Infrastructure Private Limited
+- Konkan Railway Corporation Limited
+- Larsen & Toubro Limited
+- Likhitha Infrastructure Limited
+- MKC Infrastructure Limited
+- Mastek Group
+- NCC Limited
+- NRP Projects Private Limited
+- Offshore Infrastructures Limited
+- Oriana Power Limited
+- PNC Infratech Limited
+- Param Group
+- Power Mech Projects Limited
+- Pratham Engineering
+- Preformed Line Products Company (PLP)
+- Rail Vikas Nigam Limited
+- RailTel Corporation of India Limited
+- Rays Power Infra Limited
+- ReNew Energy Global PLC
+- Sadel Group
+- Sangreen Future Renewables Private Limited
+- Saudi Services For Electro Mechanic Works Company Limited
+- Shapoorji Pallonji & Company Private Limited
+- Siemens Energy India Limited
+- Simplex Infrastructures Limited
+- Sinohydro Corporation Limited
+- Skipper Limited
+- Solarworld Energy Solutions Limited
+- State Grid Corporation of China
+- Sterling and Wilson Renewable Energy Limited
+- Sterlite Power Transmission Limited
+- Tata Power Solar Systems Limited
+- Tata Projects Limited
+- Techno Electric & Engineering Company Limited
+- Texmaco Rail & Engineering Limited
+- Tolahi Projects Private Limited
+- Transrail Lighting Limited
 
 ====================
 CATEGORIES
@@ -1742,7 +1800,6 @@ def main():
     # Build dynamic prompt
     logging.info("\n🔧 Building enhanced analysis prompt...")
     full_prompt = build_full_analysis_prompt(
-        competitors=competitor_data['official_names'],
         categories=excel_data['categories']
     )
     logging.info(f"   ✅ Prompt built with {len(excel_data['competitors'])} competitors and {len(excel_data['categories'])} categories")
