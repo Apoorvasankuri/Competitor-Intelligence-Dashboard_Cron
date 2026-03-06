@@ -1590,188 +1590,173 @@ def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def generate_summaries_from_fingerprints(df: pd.DataFrame) -> pd.DataFrame:
+# ============================================================================
+# LLM SUMMARY GENERATION
+# ============================================================================
+
+SUMMARY_SYSTEM_PROMPT = """You are a senior competitive intelligence analyst for KEC International, an infrastructure EPC company.
+
+Your job is to write concise 1-2 sentence executive summaries of competitor news articles.
+
+Structure each summary as:
+- Sentence 1: Who did what (the core event, using the competitor's exact full name)
+- Sentence 2: Scale and context (contract value in ₹, geography, project scope/specs)
+
+Rules:
+- Use the EXACT competitor name provided in the "Competitor" field — do not abbreviate
+- Be specific: include ₹ values, MW/km figures, location names wherever available
+- Anchor on the pre-extracted facts (fingerprint) first, use raw content only to add colour
+- Keep it under 40 words total
+- Write in third person, present tense
+- No filler phrases like "it is worth noting" or "this highlights"
+- Return ONLY a JSON array of strings, no explanation, no markdown"""
+
+
+@retry(
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RateLimitError),
+    reraise=True
+)
+def batch_generate_summaries(articles_batch: List[Dict]) -> List[str]:
+    """Generate rich 1-2 sentence LLM summaries for a batch of articles."""
+
+    articles_text = ""
+    for i, article in enumerate(articles_batch):
+        content = article.get('content', '')[:1500] or article.get('title', '')
+
+        # Format fingerprint as clean key: value lines, skipping nulls
+        fp = article.get('fingerprint', {})
+        fp_text = ''
+        if fp and isinstance(fp, dict):
+            fp_lines = [f"  {k}: {v}" for k, v in fp.items() if v is not None]
+            if fp_lines:
+                fp_text = "Pre-extracted facts:\n" + "\n".join(fp_lines)
+
+        articles_text += f"""
+--- ARTICLE {i+1} ---
+Title: {article['title']}
+Competitor: {article['competitor_tagging']}
+SBU: {article['sbu_tagging']}
+Category: {article['category_tag']}
+Geography: {article.get('geography') or 'Not specified'}
+Contract Value (INR Crore): {article.get('contract_value_inr_crore') or 'Not specified'}
+{fp_text}
+Raw content: {content}
+"""
+
+    prompt = f"""Write a 1-2 sentence executive summary for each of these {len(articles_batch)} articles.
+
+{articles_text}
+
+Return a JSON array of strings, one summary per article, in the same order:
+["Summary for article 1.", "Summary for article 2.", ...]
+
+Remember:
+- Use the exact competitor name from the "Competitor" field
+- Anchor on the pre-extracted facts first
+- Sentence 3 must mention KEC's competitive exposure (which SBU is affected)
+- Under 40 words per summary"""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=len(articles_batch) * 150,
+            temperature=0,
+            system=[
+                {
+                    "type": "text",
+                    "text": SUMMARY_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        raw = response.content[0].text.strip()
+
+        # Log cache usage
+        usage = response.usage
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+        cache_create = getattr(usage, 'cache_creation_input_tokens', 0)
+        if cache_read > 0:
+            logging.info(f"   💾 Cache HIT: {cache_read} tokens")
+        elif cache_create > 0:
+            logging.info(f"   💾 Cache WRITE: {cache_create} tokens")
+
+        # Strip markdown fences
+        raw = re.sub(r'^```json\s*', '', raw)
+        raw = re.sub(r'^```\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+
+        json_match = re.search(r'\[[\s\S]*\]', raw)
+        if json_match:
+            summaries = json.loads(json_match.group(0))
+            # Pad with title fallbacks if model returned fewer than expected
+            while len(summaries) < len(articles_batch):
+                summaries.append(articles_batch[len(summaries)]['title'])
+            return [str(s) for s in summaries[:len(articles_batch)]]
+
+        raise ValueError("No JSON array found in response")
+
+    except Exception as e:
+        logging.error(f"Batch summary generation failed: {e}")
+        return [a['title'] for a in articles_batch]
+
+
+def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate summaries programmatically from stored fingerprints + analysis results.
-    No API calls needed — purely deterministic.
+    Orchestrates batched LLM summary generation using fingerprints + scraped content.
+    Call this BEFORE dropping the _fingerprint column.
+    Runs 3 batches concurrently with prompt caching.
     """
-    logging.info("\n📝 Generating summaries from fingerprints...")
+    logging.info("\n📝 Generating LLM summaries (batched, fingerprint-anchored)...")
 
-    summary_count = 0
+    if df.empty:
+        return df
 
-    for idx, row in df.iterrows():
-        fp = row.get('_fingerprint', {})
-        if not fp or not isinstance(fp, dict):
-            df.at[idx, 'summary'] = str(row.get('News Title', ''))
-            continue
+    SUMMARY_BATCH_SIZE = 5
+    all_indices = list(df.index)
+    total = len(all_indices)
+    total_batches = (total + SUMMARY_BATCH_SIZE - 1) // SUMMARY_BATCH_SIZE
 
-        category = str(row.get('category_tag', '')).lower()
-        competitor = str(row.get('competitor_tagging', '-'))
-        sbu = str(row.get('sbu_tagging', 'General'))
-        geography = str(row.get('geography', '')) if pd.notna(row.get('geography')) else ''
-        contract_value = row.get('contract_value_inr_crore')
+    logging.info(f"   Articles: {total} | Batches: {total_batches} | Concurrency: 3")
 
-        # Build summary based on category
-        parts = []
+    # Build batches — include fingerprint from _fingerprint column
+    all_batches = []
+    for i in range(0, total, SUMMARY_BATCH_SIZE):
+        batch_indices = all_indices[i:i + SUMMARY_BATCH_SIZE]
+        articles_batch = []
+        for idx in batch_indices:
+            row = df.loc[idx]
+            articles_batch.append({
+                'title': str(row.get('News Title', '')),
+                'competitor_tagging': str(row.get('competitor_tagging', '-')),
+                'sbu_tagging': str(row.get('sbu_tagging', 'General')),
+                'category_tag': str(row.get('category_tag', '')),
+                'geography': row.get('geography'),
+                'contract_value_inr_crore': row.get('contract_value_inr_crore'),
+                'content': str(row.get('scraped_content', '')),
+                'fingerprint': row.get('_fingerprint', {})  # ← key addition
+            })
+        all_batches.append((batch_indices, articles_batch))
 
-        if category == 'order wins':
-            company = fp.get('company') or competitor
-            value = fp.get('contract_value_crore') or contract_value
-            scope = fp.get('scope') or ''
-            location = fp.get('location') or geography
-            client = fp.get('client_or_authority') or ''
+    def run_batch(batch_tuple):
+        batch_indices, articles_batch = batch_tuple
+        summaries = batch_generate_summaries(articles_batch)
+        return batch_indices, summaries
 
-            parts.append(f"{company} secured")
-            if value:
-                parts.append(f"₹{value} crore")
-            if client:
-                parts.append(f"contract from {client}")
-            else:
-                parts.append("contract")
-            if scope:
-                parts.append(f"for {scope}")
-            if location:
-                parts.append(f"in {location}")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(run_batch, b): b for b in all_batches}
+        for future in as_completed(futures):
+            batch_indices, summaries = future.result()
+            for idx, summary in zip(batch_indices, summaries):
+                df.at[idx, 'summary'] = summary
+                logging.info(f"   ✅ {str(df.loc[idx, 'News Title'])[:50]}...")
+                logging.info(f"      → {summary[:80]}...")
 
-        elif category == 'bidding activity':
-            companies = fp.get('companies_bidding') or competitor
-            value = fp.get('project_value_crore') or contract_value
-            scope = fp.get('scope') or ''
-            client = fp.get('client_or_authority') or ''
-            location = fp.get('location') or geography
-
-            parts.append(f"{companies} competing for")
-            if client:
-                parts.append(f"{client}'s")
-            if value:
-                parts.append(f"₹{value} crore")
-            if scope:
-                parts.append(f"{scope} project")
-            else:
-                parts.append("project")
-            if location:
-                parts.append(f"in {location}")
-
-        elif category == 'financial':
-            company = fp.get('company') or competitor
-            period = fp.get('period') or ''
-            revenue = fp.get('revenue_crore')
-            profit = fp.get('profit_crore')
-            order_book = fp.get('order_book_crore')
-
-            parts.append(f"{company}")
-            if period:
-                parts.append(f"{period}")
-            if revenue:
-                parts.append(f"revenue ₹{revenue} crore")
-            if profit:
-                parts.append(f"profit ₹{profit} crore")
-            if order_book:
-                parts.append(f"order book ₹{order_book} crore")
-
-        elif category == 'project execution':
-            company = fp.get('company') or competitor
-            project = fp.get('project_name') or ''
-            scale = fp.get('capacity_or_scale') or ''
-            location = fp.get('location') or geography
-            milestone = fp.get('milestone') or ''
-
-            parts.append(f"{company}")
-            if milestone:
-                parts.append(f"{milestone}")
-            if project:
-                parts.append(f"{project}")
-            if scale:
-                parts.append(f"({scale})")
-            if location:
-                parts.append(f"in {location}")
-
-        elif category == 'mergers & acquisitions':
-            acquirer = fp.get('acquirer') or competitor
-            target = fp.get('target_company') or ''
-            value = fp.get('deal_value_crore') or contract_value
-            stake = fp.get('stake_percent') or ''
-
-            parts.append(f"{acquirer}")
-            if target:
-                parts.append(f"acquiring {target}")
-            if stake:
-                parts.append(f"({stake}% stake)")
-            if value:
-                parts.append(f"for ₹{value} crore")
-
-        elif category == 'partnerships & alliances':
-            companies = fp.get('companies_involved') or competitor
-            deal_type = fp.get('deal_type') or 'partnership'
-            sector = fp.get('sector') or sbu
-            value = fp.get('value_crore') or contract_value
-
-            parts.append(f"{companies} formed {deal_type}")
-            if sector:
-                parts.append(f"in {sector}")
-            if value:
-                parts.append(f"worth ₹{value} crore")
-
-        elif category == 'stock market':
-            company = fp.get('company') or competitor
-            movement = fp.get('price_movement_percent') or ''
-            trigger = fp.get('trigger_event') or ''
-
-            parts.append(f"{company} stock")
-            if movement:
-                parts.append(f"moved {movement}%")
-            if trigger:
-                parts.append(f"on {trigger}")
-
-        elif category == 'regulatory & policy':
-            authority = fp.get('authority') or ''
-            policy = fp.get('policy_or_rule') or ''
-            sector = fp.get('sector_affected') or sbu
-
-            if authority:
-                parts.append(f"{authority}")
-            if policy:
-                parts.append(f"announced {policy}")
-            if sector:
-                parts.append(f"affecting {sector}")
-
-        elif category == 'industry trends':
-            topic = fp.get('topic') or ''
-            stat = fp.get('key_stat') or ''
-            geo = fp.get('geography') or geography
-
-            if topic:
-                parts.append(f"{topic}")
-            if stat:
-                parts.append(f"— {stat}")
-            if geo:
-                parts.append(f"in {geo}")
-
-        else:
-            # Fallback: use title
-            parts.append(str(row.get('News Title', '')))
-
-        summary = ' '.join(parts).strip()
-
-        # Fallback if summary is too short or empty
-        if len(summary) < 15:
-            summary = str(row.get('News Title', ''))
-
-        # Truncate if too long (max ~60 words)
-        words = summary.split()
-        if len(words) > 60:
-            summary = ' '.join(words[:60]) + '.'
-
-        # Ensure it ends with a period
-        if summary and not summary.endswith('.'):
-            summary += '.'
-
-        df.at[idx, 'summary'] = summary
-        summary_count += 1
-
-    logging.info(f"   ✅ Generated {summary_count} summaries (0 API calls)")
+    logging.info(f"   ✅ Done: {total} summaries in {total_batches} API calls")
     return df
-
 
 # ============================================================================
 # RANKING
@@ -1952,7 +1937,7 @@ def main():
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     if len(high_relevance_df) > 0:
         high_relevance_df = deduplicate_articles(high_relevance_df)
-        high_relevance_df = generate_summaries_from_fingerprints(high_relevance_df)
+        high_relevance_df = generate_llm_summaries(high_relevance_df)  # fingerprint still alive
         high_relevance_df = high_relevance_df.drop(columns=['_fingerprint'], errors='ignore')
 
     # Save to processed_articles table (only deduplicated high-relevance)
