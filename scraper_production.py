@@ -13,6 +13,7 @@ from datetime import datetime
 from urllib.parse import quote
 import os
 import logging
+import random
 import re
 import pandas as pd
 from typing import List, Dict, Set
@@ -25,9 +26,17 @@ logging.basicConfig(
 
 # Configuration
 LOOKBACK_DAYS = 1
-MAX_CONCURRENT_REQUESTS = 10  # Limit concurrent requests
-REQUEST_DELAY = 0.5  # Delay between requests in seconds
+MAX_CONCURRENT_REQUESTS = 5  # Limit concurrent requests
+REQUEST_DELAY = 1  # Delay between requests in seconds
 EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
+# Rotate User-Agents to avoid fingerprinting
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
 
 
 def load_keywords_from_excel():
@@ -115,35 +124,52 @@ def detect_competitor(title: str, source: str, competitor_to_sbu: Dict, competit
     return ", ".join(sorted(detected_competitors)) if detected_competitors else ""
 
 
-async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int) -> Dict:
-    """Asynchronously fetch RSS feed for a given keyword"""
+async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int, semaphore: asyncio.Semaphore) -> Dict:
+    """Asynchronously fetch RSS feed with rate limiting and retry logic"""
     encoded_keyword = quote(keyword)
     rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+when:{lookback_days}d&hl=en-IN&gl=IN&ceid=IN:en"
     
-    try:
-        # Use aiohttp to fetch the feed
-        async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-            content = await response.text()
-            
-            # Parse with feedparser (it's synchronous but fast)
-            feed = feedparser.parse(content)
-            
-            if feed.bozo and hasattr(feed, 'bozo_exception'):
-                logging.warning(f"Feed parse warning for '{keyword}': {feed.bozo_exception}")
-            
-            return {
-                'keyword': keyword,
-                'feed': feed,
-                'success': True
-            }
-    
-    except Exception as e:
-        logging.error(f"Error fetching feed for '{keyword}': {e}")
-        return {
-            'keyword': keyword,
-            'feed': None,
-            'success': False
-        }
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+    }
+
+    async with semaphore:
+        for attempt in range(3):
+            try:
+                jitter = random.uniform(0.5, 1.5)
+                await asyncio.sleep(REQUEST_DELAY * jitter)
+
+                async with session.get(rss_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 503:
+                        wait = (attempt + 1) * 10
+                        logging.warning(f"503 for '{keyword}' (attempt {attempt+1}/3), waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    
+                    if response.status == 429:
+                        wait = (attempt + 1) * 30
+                        logging.warning(f"429 rate limited for '{keyword}', waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    if feed.bozo and hasattr(feed, 'bozo_exception'):
+                        logging.warning(f"Feed parse warning for '{keyword}': {feed.bozo_exception}")
+                    
+                    return {'keyword': keyword, 'feed': feed, 'success': True}
+
+            except Exception as e:
+                logging.error(f"Error fetching feed for '{keyword}' (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 5)
+
+    return {'keyword': keyword, 'feed': None, 'success': False}
 
 
 async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[str], 
@@ -153,23 +179,14 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     seen_links = set()
     
     # Create aiohttp session
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
-    timeout = aiohttp.ClientTimeout(total=60)
-    
+    timeout = aiohttp.ClientTimeout(total=120)
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # Create tasks for all keywords
-        tasks = []
-        for keyword in competitor_keywords:
-            task = fetch_feed_async(session, keyword, lookback_days)
-            tasks.append(task)
-            
-            # Add small delay between task creation to avoid overwhelming the server
-            await asyncio.sleep(REQUEST_DELAY / len(competitor_keywords))
-        
-        # Execute all tasks concurrently with progress tracking
-        logging.info(f"Fetching {len(tasks)} RSS feeds concurrently...")
-        results = await asyncio.gather(*tasks)
-    
+        tasks = [fetch_feed_async(session, kw, lookback_days, semaphore) for kw in competitor_keywords]
+        logging.info(f"Fetching {len(tasks)} RSS feeds (max {MAX_CONCURRENT_REQUESTS} concurrent)...")
+        results = await asyncio.gather(*tasks)    
     # Process results
     successful_fetches = 0
     for result in results:
