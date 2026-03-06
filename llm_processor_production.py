@@ -1737,7 +1737,7 @@ Rules:
 - Use the EXACT competitor name provided in the "Competitor" field — do not abbreviate
 - Be specific: include ₹ values, MW/km figures, location names wherever available
 - Anchor on the pre-extracted facts (fingerprint) first, use raw content only to add colour
-- Keep it under 40 words total
+- Keep it under 60 words total
 - Write in third person, present tense
 - No filler phrases like "it is worth noting" or "this highlights"
 - Return ONLY a JSON array of strings, no explanation, no markdown"""
@@ -1786,7 +1786,7 @@ Return a JSON array of strings, one summary per article, in the same order:
 Remember:
 - Use the exact competitor name from the "Competitor" field
 - Anchor on the pre-extracted facts first
-- Under 40 words per summary"""
+- Under 60 words per summary"""
 
     try:
         response = client.messages.create(
