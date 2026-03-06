@@ -74,7 +74,7 @@ def load_raw_articles() -> pd.DataFrame:
             link,
             content
         FROM raw_scraped_articles
-        WHERE published_date >= NOW() - INTERVAL '1 days'
+        WHERE published_date BETWEEN '2026-02-25' AND '2026-02-28'
         ORDER BY published_date DESC
         LIMIT 500
     """
@@ -1526,12 +1526,15 @@ def fingerprints_match(fp1: Dict, fp2: Dict, category: str) -> bool:
         return company_ok and period_ok and revenue_ok
 
     elif cat == "mergers & acquisitions":
-        acquirer_ok = company_match(fp1.get('acquirer'), fp2.get('acquirer'))
-        target_ok = company_match(fp1.get('target_company'), fp2.get('target_company'))
-        v1, v2 = fp1.get('deal_value_crore'), fp2.get('deal_value_crore')
-        value_ok = values_similar(v1, v2) if (v1 and v2) else True
-        return acquirer_ok and target_ok and value_ok
-
+    acquirer_ok = company_match(fp1.get('acquirer'), fp2.get('acquirer'))
+    target_ok = company_match(fp1.get('target_company'), fp2.get('target_company'))
+    v1, v2 = fp1.get('deal_value_crore'), fp2.get('deal_value_crore')
+    value_ok = values_similar(v1, v2) if (v1 and v2) else True
+    # If both companies null, fall back to competitor group match
+    if not fp1.get('acquirer') and not fp1.get('target_company'):
+        return True  # Same competitor group + same category = duplicate
+    return (acquirer_ok or target_ok) and value_ok
+    
     elif cat == "partnerships & alliances":
         companies1 = normalize(fp1.get('companies_involved') or '')
         companies2 = normalize(fp2.get('companies_involved') or '')
@@ -1724,7 +1727,7 @@ def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
 
 SUMMARY_SYSTEM_PROMPT = """You are a senior competitive intelligence analyst for KEC International, an infrastructure EPC company.
 
-Your job is to write concise 1-2 sentence executive summaries of competitor news articles.
+Your job is to write concise 2-3 sentence executive summaries of competitor news articles.
 
 Structure each summary as:
 - Sentence 1: Who did what (the core event, using the competitor's exact full name)
@@ -1747,7 +1750,7 @@ Rules:
     reraise=True
 )
 def batch_generate_summaries(articles_batch: List[Dict]) -> List[str]:
-    """Generate rich 1-2 sentence LLM summaries for a batch of articles."""
+    """Generate rich 2-3 sentence LLM summaries for a batch of articles."""
 
     articles_text = ""
     for i, article in enumerate(articles_batch):
@@ -1773,7 +1776,7 @@ Contract Value (INR Crore): {article.get('contract_value_inr_crore') or 'Not spe
 Raw content: {content}
 """
 
-    prompt = f"""Write a 1-2 sentence executive summary for each of these {len(articles_batch)} articles.
+    prompt = f"""Write a 2-3 sentence executive summary for each of these {len(articles_batch)} articles.
 
 {articles_text}
 
