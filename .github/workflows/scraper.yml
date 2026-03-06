@@ -1,0 +1,27 @@
+name: Run Scraper
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Runs daily at 2:00 AM UTC (7:30 AM IST)
+  workflow_dispatch:        # Allows manual trigger from GitHub
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scraper_production.py
