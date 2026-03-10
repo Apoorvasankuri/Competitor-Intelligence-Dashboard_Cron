@@ -1733,18 +1733,17 @@ Your job is to write concise 2-3 sentence executive summaries of competitor news
 Structure each summary as:
 - Sentence 1: Who did what (the core event, using the competitor's exact full name)
 - Sentence 2: Scale and context (contract value in ₹, geography, project scope/specs)
+- Sentence 3: Strategic implication for KEC (which SBU is affected, competitive threat)
 
 Rules:
-- - Use the EXACT competitor name provided in the "Competitor" field — do not abbreviate
-- If the Competitor field is "-" or empty, infer the company name from the article title or content
-- NEVER write "-" or "Unknown" in the summary — always use a real company name
+- Use the EXACT competitor name from the "Competitor" field — if "-" or empty, infer from content
+- NEVER write "-" or "Unknown" as a company name
 - Be specific: include ₹ values, MW/km figures, location names wherever available
 - Anchor on the pre-extracted facts (fingerprint) first, use raw content only to add colour
 - Keep it under 60 words total
 - Write in third person, present tense
 - No filler phrases like "it is worth noting" or "this highlights"
 - Return ONLY a JSON array of strings, no explanation, no markdown"""
-
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
