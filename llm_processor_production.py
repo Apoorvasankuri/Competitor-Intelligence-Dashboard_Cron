@@ -74,7 +74,7 @@ def load_raw_articles() -> pd.DataFrame:
             link,
             content
         FROM raw_scraped_articles
-        WHERE published_date BETWEEN '2026-02-25' AND '2026-02-28'
+        WHERE published_date BETWEEN '2026-02-25' AND '2026-02-27'
         ORDER BY published_date DESC
         LIMIT 500
     """
