@@ -1663,9 +1663,10 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
                 except:
                     date_diff = 0
 
-                if date_diff > 3:
+                wide_window_cats = {'mergers & acquisitions', 'partnerships & alliances', 'legal & disputes'}
+                max_days = 5 if cat_i in wide_window_cats else 3
+                if date_diff > max_days:
                     continue
-
                 # Only compare same category articles
                 cat_i = str(row_i.get('category_tag', '')).lower()
                 cat_j = str(row_j.get('category_tag', '')).lower()
