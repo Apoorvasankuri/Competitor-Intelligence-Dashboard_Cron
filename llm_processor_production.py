@@ -1735,7 +1735,9 @@ Structure each summary as:
 - Sentence 2: Scale and context (contract value in ₹, geography, project scope/specs)
 
 Rules:
-- Use the EXACT competitor name provided in the "Competitor" field — do not abbreviate
+- - Use the EXACT competitor name provided in the "Competitor" field — do not abbreviate
+- If the Competitor field is "-" or empty, infer the company name from the article title or content
+- NEVER write "-" or "Unknown" in the summary — always use a real company name
 - Be specific: include ₹ values, MW/km figures, location names wherever available
 - Anchor on the pre-extracted facts (fingerprint) first, use raw content only to add colour
 - Keep it under 60 words total
@@ -1759,12 +1761,16 @@ def batch_generate_summaries(articles_batch: List[Dict]) -> List[str]:
 
         # Format fingerprint as clean key: value lines, skipping nulls
         fp = article.get('fingerprint', {})
-        fp_text = ''
-        if fp and isinstance(fp, dict):
-            fp_lines = [f"  {k}: {v}" for k, v in fp.items() if v is not None]
-            if fp_lines:
-                fp_text = "Pre-extracted facts:\n" + "\n".join(fp_lines)
-
+fp_text = ''
+if fp and isinstance(fp, dict):
+    fp_lines = []
+    for k, v in fp.items():
+        if v is not None:
+            if isinstance(v, list):
+                v = ', '.join(str(x) for x in v)
+            fp_lines.append(f"  {k}: {v}")
+    if fp_lines:
+        fp_text = "Pre-extracted facts:\n" + "\n".join(fp_lines)
         articles_text += f"""
 --- ARTICLE {i+1} ---
 Title: {article['title']}
@@ -1859,18 +1865,25 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
         batch_indices = all_indices[i:i + SUMMARY_BATCH_SIZE]
         articles_batch = []
         for idx in batch_indices:
-            row = df.loc[idx]
-            articles_batch.append({
-                'title': str(row.get('News Title', '')),
-                'competitor_tagging': str(row.get('competitor_tagging', '-')),
-                'sbu_tagging': str(row.get('sbu_tagging', 'General')),
-                'category_tag': str(row.get('category_tag', '')),
-                'geography': row.get('geography'),
-                'contract_value_inr_crore': row.get('contract_value_inr_crore'),
-                'content': str(row.get('scraped_content', '')),
-                'fingerprint': row.get('_fingerprint', {})  # ← key addition
-            })
-        all_batches.append((batch_indices, articles_batch))
+    row = df.loc[idx]
+    content = str(row.get('scraped_content', ''))
+    fingerprint = row.get('_fingerprint', {})
+
+    # If no content and no fingerprint, use title directly — skip LLM
+    if not content.strip() and not fingerprint:
+        df.at[idx, 'summary'] = str(row.get('News Title', ''))
+        continue
+
+    articles_batch.append({
+        'title': str(row.get('News Title', '')),
+        'competitor_tagging': str(row.get('competitor_tagging', '-')),
+        'sbu_tagging': str(row.get('sbu_tagging', 'General')),
+        'category_tag': str(row.get('category_tag', '')),
+        'geography': row.get('geography'),
+        'contract_value_inr_crore': row.get('contract_value_inr_crore'),
+        'content': content,
+        'fingerprint': fingerprint
+    })        all_batches.append((batch_indices, articles_batch))
 
     def run_batch(batch_tuple):
         batch_indices, articles_batch = batch_tuple
