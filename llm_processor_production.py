@@ -1526,14 +1526,14 @@ def fingerprints_match(fp1: Dict, fp2: Dict, category: str) -> bool:
         return company_ok and period_ok and revenue_ok
 
     elif cat == "mergers & acquisitions":
-    acquirer_ok = company_match(fp1.get('acquirer'), fp2.get('acquirer'))
-    target_ok = company_match(fp1.get('target_company'), fp2.get('target_company'))
-    v1, v2 = fp1.get('deal_value_crore'), fp2.get('deal_value_crore')
-    value_ok = values_similar(v1, v2) if (v1 and v2) else True
-    # If both companies null, fall back to competitor group match
-    if not fp1.get('acquirer') and not fp1.get('target_company'):
-        return True  # Same competitor group + same category = duplicate
-    return (acquirer_ok or target_ok) and value_ok
+        acquirer_ok = company_match(fp1.get('acquirer'), fp2.get('acquirer'))
+        target_ok = company_match(fp1.get('target_company'), fp2.get('target_company'))
+        v1, v2 = fp1.get('deal_value_crore'), fp2.get('deal_value_crore')
+        value_ok = values_similar(v1, v2) if (v1 and v2) else True
+        # If both companies null, fall back to competitor group match
+        if not fp1.get('acquirer') and not fp1.get('target_company'):
+            return True  # Same competitor group + same category = duplicate
+        return (acquirer_ok or target_ok) and value_ok
     
     elif cat == "partnerships & alliances":
         companies1 = normalize(fp1.get('companies_involved') or '')
