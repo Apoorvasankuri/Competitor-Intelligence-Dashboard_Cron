@@ -282,12 +282,12 @@ def save_to_database(articles: List[Dict]):
         logging.info("No articles to save")
         return
     
-    # Filter to only keep articles between Mar 4 and Mar 7
+    # Filter to only keep articles between Mar 8 and Mar 9
     from datetime import date
-    start_date = date(2026, 3, 4)
-    end_date = date(2026, 3, 7)
+    start_date = date(2026, 3, 8)
+    end_date = date(2026, 3, 9)
     articles = [a for a in articles if start_date <= a['published_date'].date() <= end_date]
-    logging.info(f"After date filter (Mar 4 - Mar 7): {len(articles)} articles")
+    logging.info(f"After date filter (Mar 8 - Mar 9): {len(articles)} articles")
     
     if not articles:
         logging.info("No articles in date range")
