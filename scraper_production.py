@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 
 # Configuration
-LOOKBACK_DAYS = 10
+LOOKBACK_DAYS = 15
 MAX_CONCURRENT_REQUESTS = 5  # Limit concurrent requests
 REQUEST_DELAY = 1  # Delay between requests in seconds
 EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
@@ -285,7 +285,7 @@ def save_to_database(articles: List[Dict]):
     # Filter to only keep articles between Feb 25 and Mar 5
     from datetime import date
     start_date = date(2026, 2, 25)
-    end_date = date(2026, 2, 28)
+    end_date = date(2026, 2, 27)
     articles = [a for a in articles if start_date <= a['published_date'].date() <= end_date]
     logging.info(f"After date filter (Feb 25 - Feb 28): {len(articles)} articles")
     
