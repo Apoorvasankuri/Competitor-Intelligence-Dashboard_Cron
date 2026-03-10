@@ -1157,6 +1157,10 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     df['category_tag'] = 'not_analyzed'
     df['summary'] = 'Not analyzed (low relevance)'
     df['scraped_content'] = ''
+    df['rank_score'] = 0
+    df['competitor_tier'] = 3
+    df['contract_value_inr_crore'] = None
+    df['geography'] = None
     
     total = len(high_rel_df)
     total_batches = (total + STAGE2_BATCH_SIZE - 1) // STAGE2_BATCH_SIZE
@@ -1761,15 +1765,16 @@ def batch_generate_summaries(articles_batch: List[Dict]) -> List[str]:
         # Format fingerprint as clean key: value lines, skipping nulls
         fp = article.get('fingerprint', {})
 fp_text = ''
-if fp and isinstance(fp, dict):
-    fp_lines = []
-    for k, v in fp.items():
-        if v is not None:
-            if isinstance(v, list):
-                v = ', '.join(str(x) for x in v)
-            fp_lines.append(f"  {k}: {v}")
-    if fp_lines:
-        fp_text = "Pre-extracted facts:\n" + "\n".join(fp_lines)
+        if fp and isinstance(fp, dict):
+            fp_lines = []
+            for k, v in fp.items():
+                if v is not None:
+                    if isinstance(v, list):
+                        v = ', '.join(str(x) for x in v)
+                    fp_lines.append(f"  {k}: {v}")
+            if fp_lines:
+                fp_text = "Pre-extracted facts:\n" + "\n".join(fp_lines)
+
         articles_text += f"""
 --- ARTICLE {i+1} ---
 Title: {article['title']}
@@ -1781,7 +1786,6 @@ Contract Value (INR Crore): {article.get('contract_value_inr_crore') or 'Not spe
 {fp_text}
 Raw content: {content}
 """
-
     prompt = f"""Write a 2-3 sentence executive summary for each of these {len(articles_batch)} articles.
 
 {articles_text}
@@ -1873,16 +1877,18 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
         df.at[idx, 'summary'] = str(row.get('News Title', ''))
         continue
 
-    articles_batch.append({
-        'title': str(row.get('News Title', '')),
-        'competitor_tagging': str(row.get('competitor_tagging', '-')),
-        'sbu_tagging': str(row.get('sbu_tagging', 'General')),
-        'category_tag': str(row.get('category_tag', '')),
-        'geography': row.get('geography'),
-        'contract_value_inr_crore': row.get('contract_value_inr_crore'),
-        'content': content,
-        'fingerprint': fingerprint
-    })        all_batches.append((batch_indices, articles_batch))
+        articles_batch.append({
+            'title': str(row.get('News Title', '')),
+            'competitor_tagging': str(row.get('competitor_tagging', '-')),
+            'sbu_tagging': str(row.get('sbu_tagging', 'General')),
+            'category_tag': str(row.get('category_tag', '')),
+            'geography': row.get('geography'),
+            'contract_value_inr_crore': row.get('contract_value_inr_crore'),
+            'content': content,
+            'fingerprint': fingerprint
+        })        
+    
+    all_batches.append((batch_indices, articles_batch))
 
     def run_batch(batch_tuple):
         batch_indices, articles_batch = batch_tuple
