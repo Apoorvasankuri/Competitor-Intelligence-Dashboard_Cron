@@ -1764,7 +1764,7 @@ def batch_generate_summaries(articles_batch: List[Dict]) -> List[str]:
 
         # Format fingerprint as clean key: value lines, skipping nulls
         fp = article.get('fingerprint', {})
-fp_text = ''
+        fp_text = ''
         if fp and isinstance(fp, dict):
             fp_lines = []
             for k, v in fp.items():
@@ -1868,27 +1868,27 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
         batch_indices = all_indices[i:i + SUMMARY_BATCH_SIZE]
         articles_batch = []
         for idx in batch_indices:
-    row = df.loc[idx]
-    content = str(row.get('scraped_content', ''))
-    fingerprint = row.get('_fingerprint', {})
+            row = df.loc[idx]
+            content = str(row.get('scraped_content', ''))
+            fingerprint = row.get('_fingerprint', {})
 
-    # If no content and no fingerprint, use title directly — skip LLM
-    if not content.strip() and not fingerprint:
-        df.at[idx, 'summary'] = str(row.get('News Title', ''))
-        continue
+            # If no content and no fingerprint, use title directly — skip LLM
+            if not content.strip() and not fingerprint:
+                df.at[idx, 'summary'] = str(row.get('News Title', ''))
+                continue
 
-        articles_batch.append({
-            'title': str(row.get('News Title', '')),
-            'competitor_tagging': str(row.get('competitor_tagging', '-')),
-            'sbu_tagging': str(row.get('sbu_tagging', 'General')),
-            'category_tag': str(row.get('category_tag', '')),
-            'geography': row.get('geography'),
-            'contract_value_inr_crore': row.get('contract_value_inr_crore'),
-            'content': content,
-            'fingerprint': fingerprint
-        })        
+            articles_batch.append({
+                'title': str(row.get('News Title', '')),
+                'competitor_tagging': str(row.get('competitor_tagging', '-')),
+                'sbu_tagging': str(row.get('sbu_tagging', 'General')),
+                'category_tag': str(row.get('category_tag', '')),
+                'geography': row.get('geography'),
+                'contract_value_inr_crore': row.get('contract_value_inr_crore'),
+                'content': content,
+                'fingerprint': fingerprint
+            })        
     
-    all_batches.append((batch_indices, articles_batch))
+        all_batches.append((batch_indices, articles_batch))
 
     def run_batch(batch_tuple):
         batch_indices, articles_batch = batch_tuple
