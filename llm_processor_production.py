@@ -76,7 +76,7 @@ def load_raw_articles() -> pd.DataFrame:
         FROM raw_scraped_articles
         WHERE published_date BETWEEN '2026-03-10' AND '2026-03-15'
         ORDER BY published_date DESC
-        LIMIT 500
+        LIMIT 5000
     """
     
     cur = conn.cursor()
