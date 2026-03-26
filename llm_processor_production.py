@@ -14,7 +14,7 @@ from anthropic import Anthropic
 from anthropic._exceptions import RateLimitError
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 yesterday = date.today() - timedelta(days=1)
 from difflib import SequenceMatcher
 
