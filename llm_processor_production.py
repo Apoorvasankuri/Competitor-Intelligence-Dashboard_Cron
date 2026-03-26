@@ -14,7 +14,8 @@ from anthropic import Anthropic
 from anthropic._exceptions import RateLimitError
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
+yesterday = date.today() - timedelta(days=1)
 from difflib import SequenceMatcher
 
 # Configure logging
@@ -62,7 +63,7 @@ def load_raw_articles() -> pd.DataFrame:
     """Load unprocessed articles from raw_scraped_articles table"""
     conn = get_db_connection()
     
-    query = """
+    query = f"""
         SELECT 
             id,
             published_date,
@@ -74,7 +75,7 @@ def load_raw_articles() -> pd.DataFrame:
             link,
             content
         FROM raw_scraped_articles
-        WHERE published_date BETWEEN '2026-03-21' AND '2026-03-24'
+        WHERE published_date = '{yesterday}'
         ORDER BY published_date DESC
         LIMIT 5000
     """
