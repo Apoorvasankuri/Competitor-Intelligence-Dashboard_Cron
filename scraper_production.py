@@ -246,7 +246,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             # Detect SBU (must match at least one SBU keyword)
             sbu = detect_sbu(title, source, sbu_keywords)
             if not sbu:
-                continue  # Skip articles without SBU relevance
+                sbu = "General"  # Let LLM decide relevance instead of dropping
             
             seen_links.add(link)
             
