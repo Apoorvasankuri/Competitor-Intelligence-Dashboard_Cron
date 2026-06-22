@@ -128,18 +128,29 @@ def save_to_processed_articles(df: pd.DataFrame):
         contract_value_inr_crore,
         geography,
         competitor_tier,
-        rank_score
+        rank_score,
+        fingerprint,
+        is_duplicate
     ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
     
     saved_count = 0
     failed_count = 0
+    duplicate_count = 0
     
     for idx, row in df.iterrows():
         try:
+            is_dup = row.get('is_duplicate', False)
+            if is_dup:
+                duplicate_count += 1
+
+            # Convert fingerprint dict to JSON string for storage
+            fp = row.get('_fingerprint') or row.get('fingerprint')
+            fp_json = json.dumps(fp) if fp and isinstance(fp, dict) else None
+
             cur = conn.cursor()
             cur.execute(insert_query, (
                 row.get('Published Date'),
@@ -155,7 +166,9 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('contract_value_inr_crore'),
                 row.get('geography'),
                 row.get('competitor_tier'),
-                row.get('rank_score', 0)
+                row.get('rank_score', 0),
+                fp_json,
+                is_dup
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -171,9 +184,9 @@ def save_to_processed_articles(df: pd.DataFrame):
     conn.close()
     
     logging.info(f"✅ Saved {saved_count} articles to processed_articles table")
+    logging.info(f"   📌 {duplicate_count} flagged as cross-batch duplicates")
     if failed_count > 0:
         logging.warning(f"⚠️  Failed to save {failed_count} articles")
-
 
 
 # ============================================================================
@@ -1470,7 +1483,56 @@ Rules:
         logging.warning(f"Fingerprint extraction failed for '{title[:50]}': {e}")
         return {}
 
+def check_fingerprint_against_db(fingerprint: Dict, category: str, competitor: str, published_date, lookback_days: int = 7) -> Dict:
+    """
+    Check if a fingerprint matches any existing article in the database.
+    Returns {"is_duplicate": True/False, "matched_article_id": id or None}
+    """
+    if not fingerprint:
+        return {"is_duplicate": False, "matched_article_id": None}
 
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Get recent articles with fingerprints in the same category/competitor group
+        cur.execute("""
+            SELECT id, news_title, fingerprint, category_tag, competitor_tagging, published_date
+            FROM processed_articles
+            WHERE fingerprint IS NOT NULL
+            AND category_tag = %s
+            AND published_date >= %s - INTERVAL '%s days'
+            AND is_duplicate = FALSE
+            ORDER BY published_date DESC
+            LIMIT 50
+        """, (category, published_date, lookback_days))
+
+        existing = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        for row in existing:
+            existing_fp = row.get('fingerprint')
+            if not existing_fp:
+                continue
+
+            # Parse if stored as string
+            if isinstance(existing_fp, str):
+                try:
+                    existing_fp = json.loads(existing_fp)
+                except:
+                    continue
+
+            if fingerprints_match(fingerprint, existing_fp, category):
+                logging.info(f"   🔄 Cross-batch duplicate found! Matches article #{row['id']}: {row['news_title'][:60]}...")
+                return {"is_duplicate": True, "matched_article_id": row['id']}
+
+        return {"is_duplicate": False, "matched_article_id": None}
+
+    except Exception as e:
+        logging.warning(f"   ⚠️ DB fingerprint check failed: {e}")
+        return {"is_duplicate": False, "matched_article_id": None}
+    
 def fingerprints_match(fp1: Dict, fp2: Dict, category: str) -> bool:
     """
     Compare two fingerprints to determine if they represent the same event.
@@ -1618,6 +1680,27 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
         time.sleep(RATE_LIMIT_DELAY)
     # Store fingerprints on DataFrame for later summary generation
     df_reset['_fingerprint'] = df_reset.index.map(lambda i: fingerprints.get(i, {}))
+
+    # Step 2.5: Cross-batch dedup — check each fingerprint against DB history
+    logging.info("\n   🗄️ Checking fingerprints against database history...")
+    df_reset['is_duplicate'] = False
+    cross_batch_dupes = 0
+
+    for idx, row in df_reset.iterrows():
+        fp = fingerprints.get(idx, {})
+        if not fp:
+            continue
+
+        category = str(row.get('category_tag', '')).lower()
+        competitor = str(row.get('competitor_tagging', '-'))
+        pub_date = row.get('Published Date')
+
+        result = check_fingerprint_against_db(fp, category, competitor, pub_date)
+        if result['is_duplicate']:
+            df_reset.at[idx, 'is_duplicate'] = True
+            cross_batch_dupes += 1
+
+    logging.info(f"   🗄️ Cross-batch duplicates found: {cross_batch_dupes}")
 
     # Step 3: Group by competitor, compare fingerprints within each group
     logging.info("\n   🔍 Comparing fingerprints within competitor groups...")
@@ -1958,8 +2041,16 @@ def main():
     # Two-phase deduplication on high-relevance articles
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
     if len(high_relevance_df) > 0:
-        high_relevance_df = deduplicate_articles(high_relevance_df)
-        high_relevance_df = generate_llm_summaries(high_relevance_df)  # fingerprint still alive
+        non_dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == False].copy()
+        dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == True].copy()
+
+        if len(non_dupes) > 0:
+            non_dupes = generate_llm_summaries(non_dupes)
+
+        if len(dupes) > 0:
+            dupes['summary'] = dupes['News Title']
+
+        high_relevance_df = pd.concat([non_dupes, dupes], ignore_index=True)
         high_relevance_df = high_relevance_df.drop(columns=['_fingerprint'], errors='ignore')
 
     # Save to processed_articles table (only deduplicated high-relevance)
