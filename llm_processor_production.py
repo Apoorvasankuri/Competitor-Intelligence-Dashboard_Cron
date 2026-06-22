@@ -355,8 +355,8 @@ KEC operates through six main business verticals (SBUs):
    
    - INTERNATIONAL T&D: Power transmission projects outside India
      • Cross-border transmission projects
-     • Grid infrastructure in Middle East, Americas, Africa, SAARC, Asia Pacific, CIS, Australia
-     • Same technical scope as India T&D but in international markets
+     • Primary focus geographies: Middle East, Africa, and South East Asia (excluding China)
+     • Same technical scope as India T&D but in these focus markets
 
 **2. TRANSPORTATION**
    - Railways: Overhead electrification (OHE), signaling systems, TCAS Kavach, railway bridges, stations & platforms
@@ -558,7 +558,7 @@ Return ONLY valid JSON with these exact field names:
   "sbu_tagging": "<comma-separated SBU names from list, or 'General'>",
   "category_tag": "<single category from list>",
   "contract_value_inr_crore": <numeric value in INR crore, or null if not mentioned>,
-  "geography": "<India/Middle East/Africa/Americas/SAARC/Other or null>"
+  "geography": "<India/Middle East/Africa/South East Asia/Americas/SAARC/Other or null>"
 }}
 
 **EXTRACTION RULES FOR NEW FIELDS:**
@@ -580,6 +580,7 @@ Return ONLY valid JSON with these exact field names:
   * "India" → Any Indian state/city
   * "Middle East" → UAE, Saudi, Qatar, Bahrain, Oman, Kuwait
   * "Africa" → Any African country
+  * "South East Asia" → Indonesia, Vietnam, Malaysia, Thailand, Philippines, Singapore, Myanmar, Cambodia, Laos ((excludes China)
   * "Americas" → USA, Brazil, etc.
   * "SAARC" → Bangladesh, Sri Lanka, Nepal, etc.
   * "Other" → Rest of world

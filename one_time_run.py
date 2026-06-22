@@ -18,11 +18,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ============================================================
 
 TARGET_COMPETITORS = [
-    "Kalpataru Projects International Limited"
+    "Kalpataru Projects International Limited",
+    "Capacite Infraprojects Limited",
+    "NCC Limited",
+    "J. Kumar Infraprojects Limited",
+    "AFCONS Infrastructure Limited",
+    "Dineshchandra R. Agrawal Infracon Private Limited",
+    "Ashoka Buildcon Limited",
+    "Hindustan Construction Company Limited",
+    "H.G. Infra Engineering Limited",
+    "Megha Engineering and Infrastructures Limited",
 ]
 
-START_DATE = date(2026, 3, 1)   # inclusive
-END_DATE   = date(2026, 6, 17)  # inclusive
+START_DATE = date(2025, 4, 1)   # inclusive
+END_DATE   = date(2026, 6, 15)  # inclusive
 
 # ============================================================
 # IMPORTS (after config so errors are obvious)
