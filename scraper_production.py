@@ -75,7 +75,7 @@ MAX_COMPETITOR_SBU_QUERIES = 100
 MAX_COMPETITOR_CLIENT_QUERIES = 75
 MAX_SBU_CLIENT_QUERIES = 60
 MAX_TOTAL_SEARCH_QUERIES = 400
-]
+
 
 
 # ============================================================
