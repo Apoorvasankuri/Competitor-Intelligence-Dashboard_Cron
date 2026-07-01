@@ -1026,6 +1026,16 @@ Provide detailed analysis."""
 # RANKING
 # ============================================================================
 
+def safe_source_authority_score(value):
+    """Coerce a source_authority_score to a safe int, defaulting to 5."""
+    try:
+        if value is None:
+            return 5
+        return int(value)
+    except Exception:
+        return 5
+
+
 def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) -> Dict:
     """
     Calculate ranking score for an article
@@ -1140,11 +1150,7 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
 
     # 6. SOURCE AUTHORITY (minimal, temporary integration — full ranking redesign comes later)
     #    Better sources add more points; low-authority sources add only a little.
-    source_authority_score = row.get("source_authority_score", 5)
-    try:
-        source_authority_score = int(source_authority_score) if source_authority_score is not None else 5
-    except Exception:
-        source_authority_score = 5
+    source_authority_score = safe_source_authority_score(row.get("source_authority_score", 5))
 
     # TOTAL RANK SCORE
     total_rank = (

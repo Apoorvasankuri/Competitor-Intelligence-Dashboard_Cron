@@ -47,6 +47,17 @@ USER_AGENTS = [
 # Lower source_priority = better source.
 # Higher source_authority_score = more trustworthy source.
 # ============================================================
+#
+# SOURCE REGISTRY DESIGN
+# Google News RSS often returns news.google.com redirect URLs.
+# Therefore, source classification must prefer publisher display name first,
+# then fall back to real publisher domain if available.
+# Do NOT classify every news.google.com link as aggregator if source_name is available.
+# Lower source_priority means better source.
+# Higher source_authority_score means more trusted source.
+# Source authority should influence ranking and representative-source selection,
+# but should NOT be used to discard articles at scraping stage.
+# ============================================================
 SOURCE_REGISTRY = [
     {
         "source_type": "official_exchange",
@@ -322,6 +333,24 @@ def looks_like_domain(name: str) -> bool:
     return ("." in name) and (" " not in name)
 
 
+def get_default_source_metadata(url: str = "") -> dict:
+    """
+    Central definition of 'unknown source' defaults.
+    Used by classify_source() so the fallback dict lives in exactly one place.
+    """
+    domain = extract_domain(url)
+    return {
+        "source_domain": domain,
+        "source_type": DEFAULT_SOURCE_TYPE,
+        "source_category": DEFAULT_SOURCE_CATEGORY,
+        "source_priority": DEFAULT_SOURCE_PRIORITY,
+        "source_authority_score": DEFAULT_SOURCE_AUTHORITY_SCORE,
+        "preferred_for_executive_summary": DEFAULT_PREFERRED_FOR_EXECUTIVE_SUMMARY,
+        "source_notes": DEFAULT_SOURCE_NOTES,
+        "source_match_method": "default"
+    }
+
+
 def classify_source(url: str, source_name: str = None) -> dict:
     """
     Classify an article's source using publisher display name first,
@@ -337,6 +366,13 @@ def classify_source(url: str, source_name: str = None) -> dict:
       3. unknown defaults.
     """
     domain = extract_domain(url)
+
+    # GUARDRAIL: classification order is intentional and must not be reordered.
+    #   1. source_name match  -> primary, because Google News links are redirects
+    #                            and the publisher display name is the reliable signal.
+    #   1b. domain-shaped name -> some feeds put a bare domain in the name slot.
+    #   2. URL domain match    -> fallback, only meaningful for real publisher URLs.
+    #   3. unknown default     -> NEVER blocks ingestion; it is metadata only.
 
     # 1. Prefer source_name matching (Google News links are redirects).
     if source_name:
@@ -395,17 +431,9 @@ def classify_source(url: str, source_name: str = None) -> dict:
                         "source_match_method": "domain"
                     }
 
-    # 3. Unknown fallback.
-    return {
-        "source_domain": domain,
-        "source_type": DEFAULT_SOURCE_TYPE,
-        "source_category": DEFAULT_SOURCE_CATEGORY,
-        "source_priority": DEFAULT_SOURCE_PRIORITY,
-        "source_authority_score": DEFAULT_SOURCE_AUTHORITY_SCORE,
-        "preferred_for_executive_summary": DEFAULT_PREFERRED_FOR_EXECUTIVE_SUMMARY,
-        "source_notes": DEFAULT_SOURCE_NOTES,
-        "source_match_method": "default"
-    }
+    # 3. Unknown fallback — metadata only. An unclassified source is still ingested;
+    #    source authority affects ranking/representative selection, never inclusion.
+    return get_default_source_metadata(url)
 
 def load_keywords_from_excel():
     """Load SBU and Competitor keywords from Excel file"""
@@ -651,7 +679,22 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     
     logging.info(f"Successfully fetched {successful_fetches}/{len(competitor_keywords)} feeds")
     logging.info(f"Found {len(all_articles)} relevant articles (with competitors AND SBU match)")
-    
+
+    # Do not filter articles based on source authority here.
+    # Low-authority sources are still useful for recall.
+    # Ranking and executive display will decide priority later.
+
+    # Per-run source diagnostics (once per run, not per article).
+    source_type_counts = {}
+    source_match_method_counts = {}
+    for a in all_articles:
+        st = a.get("source_type", "unknown")
+        mm = a.get("source_match_method", "default")
+        source_type_counts[st] = source_type_counts.get(st, 0) + 1
+        source_match_method_counts[mm] = source_match_method_counts.get(mm, 0) + 1
+    logging.info("Source type distribution: %s", source_type_counts)
+    logging.info("Source match method distribution: %s", source_match_method_counts)
+
     return all_articles
 
 
