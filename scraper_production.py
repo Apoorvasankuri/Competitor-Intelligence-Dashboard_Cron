@@ -10,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import os
 import logging
 import random
@@ -38,6 +38,332 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 ]
 
+
+# ============================================================
+# Source Registry
+# Classifies article sources by authority and reliability.
+# Supports both Google News RSS publisher display names (source_names)
+# and real publisher domains (domains).
+# Lower source_priority = better source.
+# Higher source_authority_score = more trustworthy source.
+# ============================================================
+SOURCE_REGISTRY = [
+    {
+        "source_type": "official_exchange",
+        "source_category": "official_disclosure",
+        "source_names": ["BSE India", "NSE India", "BSE", "NSE"],
+        "domains": ["bseindia.com", "nseindia.com"],
+        "source_priority": 1,
+        "source_authority_score": 60,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Official exchange filings and corporate disclosures"
+    },
+    {
+        "source_type": "government_policy",
+        "source_category": "policy_and_regulatory",
+        "source_names": [
+            "Press Information Bureau", "PIB", "Ministry of Power",
+            "Ministry of Railways", "Ministry of Road Transport and Highways",
+            "MNRE", "CEA", "CERC", "NITI Aayog"
+        ],
+        "domains": [
+            "pib.gov.in", "powermin.gov.in", "railways.gov.in", "morth.nic.in",
+            "mnre.gov.in", "cea.nic.in", "cercind.gov.in", "niti.gov.in"
+        ],
+        "source_priority": 1,
+        "source_authority_score": 58,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Government ministries, regulators, and policy sources"
+    },
+    {
+        "source_type": "client_or_authority",
+        "source_category": "primary_project_authority",
+        "source_names": [
+            "Power Grid Corporation of India", "POWERGRID", "PGCIL", "NTPC",
+            "NHAI", "SECI", "DMRC", "Delhi Metro Rail Corporation",
+            "Indian Railways", "NHSRCL", "GAIL", "ONGC", "Indian Oil", "BPCL", "HPCL"
+        ],
+        "domains": [
+            "powergrid.in", "pgcilindia.com", "ntpc.co.in", "nhai.gov.in",
+            "seci.co.in", "dmrc.org", "indianrailways.gov.in", "nhsrcl.in",
+            "gailonline.com", "ongcindia.com", "iocl.com",
+            "bharatpetroleum.in", "hindustanpetroleum.com"
+        ],
+        "source_priority": 1,
+        "source_authority_score": 60,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Project owners, PSUs, authorities, and infrastructure clients"
+    },
+    {
+        "source_type": "company_official",
+        "source_category": "primary_company_source",
+        "source_names": [
+            "Larsen & Toubro", "L&T", "Tata Projects",
+            "Kalpataru Projects International", "Kalpataru Projects",
+            "Sterlite Power", "Techno Electric", "Skipper", "IRCON", "RVNL",
+            "Rail Vikas Nigam", "Afcons Infrastructure",
+            "Hindustan Construction Company", "HCC", "NCC", "PNC Infratech",
+            "HG Infra", "Dilip Buildcon", "Ashoka Buildcon", "GR Infraprojects",
+            "Shapoorji Pallonji", "Siemens Energy", "Hitachi Energy", "GE Vernova",
+            "Sterling and Wilson Renewable Energy", "ReNew", "Tata Power Solar",
+            "Bajel Projects", "Transrail Lighting"
+        ],
+        "domains": [
+            "larsentoubro.com", "tataprojects.com", "kalpataruprojects.com",
+            "kpil.co.in", "sterlitepower.com", "technoelectric.com",
+            "skipperlimited.com", "ircon.org", "rvnl.org", "afcons.com",
+            "hccindia.com", "ncclimited.com", "pncinfra.com", "hginfra.com",
+            "dilipbuildcon.com", "ashokabuildcon.com", "grinfra.com",
+            "shapoorjipallonji.com", "siemens-energy.com", "hitachienergy.com",
+            "gevernova.com", "sterlingandwilsonre.com", "renew.com",
+            "tatapowersolar.com", "bajelprojects.com", "transrail.in", "transrail.co.in"
+        ],
+        "source_priority": 2,
+        "source_authority_score": 50,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Primary company websites, press releases, investor pages, and order announcements"
+    },
+    {
+        "source_type": "specialist_infrastructure_media",
+        "source_category": "sector_media",
+        "source_names": [
+            "Construction World", "Projects Today", "India Infrastructure",
+            "Infrastructure Today", "Construction Week India", "ET Infra",
+            "Urban Transport News", "Rail Analysis", "Metro Rail News",
+            "Railway Technology", "Global Railway Review", "International Railway Journal"
+        ],
+        "domains": [
+            "constructionworld.in", "projectstoday.com", "indiainfrastructure.com",
+            "infrastructuretoday.co.in", "constructionweekonline.in",
+            "infra.economictimes.indiatimes.com", "urbantransportnews.com",
+            "railanalysis.com", "metrorailnews.in", "railway-technology.com",
+            "globalrailwayreview.com", "railjournal.com"
+        ],
+        "source_priority": 3,
+        "source_authority_score": 38,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Specialist infrastructure, metro, rail, and project intelligence media"
+    },
+    {
+        "source_type": "specialist_power_and_energy_media",
+        "source_category": "sector_media",
+        "source_names": [
+            "ET EnergyWorld", "Power Line", "Power Today", "Power Technology",
+            "T&D World", "PV Magazine India", "Mercom India", "Saur Energy",
+            "Renewable Watch", "SolarQuarter", "Energy Storage News"
+        ],
+        "domains": [
+            "energy.economictimes.indiatimes.com", "powerline.net.in",
+            "powertoday.in", "power-technology.com", "tdworld.com",
+            "pv-magazine-india.com", "mercomindia.com", "saurenergy.com",
+            "renewablewatch.in", "solarquarter.com", "energy-storage.news"
+        ],
+        "source_priority": 3,
+        "source_authority_score": 38,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Specialist power, transmission, renewables, BESS, and grid media"
+    },
+    {
+        "source_type": "business_media",
+        "source_category": "mainstream_business_news",
+        "source_names": [
+            "Economic Times", "The Economic Times", "Business Standard", "Mint",
+            "Livemint", "Moneycontrol", "Financial Express", "The Hindu BusinessLine",
+            "BusinessLine", "CNBCTV18", "Zee Business", "Business Today",
+            "NDTV Profit", "Reuters", "Bloomberg", "Financial Times"
+        ],
+        "domains": [
+            "economictimes.indiatimes.com", "business-standard.com", "livemint.com",
+            "moneycontrol.com", "financialexpress.com", "thehindubusinessline.com",
+            "businessline.com", "cnbctv18.com", "zeebiz.com", "businesstoday.in",
+            "ndtvprofit.com", "reuters.com", "bloomberg.com", "ft.com"
+        ],
+        "source_priority": 4,
+        "source_authority_score": 30,
+        "preferred_for_executive_summary": True,
+        "source_notes": "Mainstream business and financial media"
+    },
+    {
+        "source_type": "press_release_distribution",
+        "source_category": "press_release",
+        "source_names": [
+            "PR Newswire", "Business Wire", "GlobeNewswire", "EIN Presswire",
+            "ANI", "PTI", "NewsVoir"
+        ],
+        "domains": [
+            "prnewswire.com", "businesswire.com", "globenewswire.com",
+            "einpresswire.com", "aninews.in", "ptinews.com", "newsvoir.com"
+        ],
+        "source_priority": 5,
+        "source_authority_score": 20,
+        "preferred_for_executive_summary": False,
+        "source_notes": "Press release distribution; useful for discovery but should be corroborated"
+    },
+    {
+        "source_type": "aggregator_or_syndication",
+        "source_category": "aggregator",
+        "source_names": [
+            "Google News", "Yahoo Finance", "Yahoo News", "MSN", "AOL",
+            "Devdiscourse", "LatestLY", "Big News Network"
+        ],
+        "domains": [
+            "news.google.com", "yahoo.com", "msn.com", "aol.com",
+            "devdiscourse.com", "latestly.com", "bignewsnetwork.com"
+        ],
+        "source_priority": 6,
+        "source_authority_score": 10,
+        "preferred_for_executive_summary": False,
+        "source_notes": "Aggregated or syndicated news; use only if no better source exists"
+    },
+    {
+        "source_type": "low_authority_or_noise",
+        "source_category": "low_authority",
+        "source_names": [
+            "openPR.com", "EIN News", "SBWire", "Digital Journal", "MENAFN",
+            "Benzinga", "Simply Wall St", "StockTitan", "MarketsMojo", "Equity Bulls"
+        ],
+        "domains": [
+            "openpr.com", "einnews.com", "sbwire.com", "digitaljournal.com",
+            "menafn.com", "benzinga.com", "simplywall.st", "stocktitan.net",
+            "marketsmojo.com", "equitybulls.com"
+        ],
+        "source_priority": 7,
+        "source_authority_score": 5,
+        "preferred_for_executive_summary": False,
+        "source_notes": "Low-authority, SEO-heavy, stock-only, or republished sources"
+    }
+]
+
+# Redirect / wrapper hosts that are NOT the real publisher.
+# Google News RSS links resolve to news.google.com redirects, so at scrape
+# time the extracted domain is almost always one of these.
+REDIRECT_HOSTS = {"news.google.com"}
+
+DEFAULT_SOURCE_TYPE = "unknown"
+DEFAULT_SOURCE_CATEGORY = "unknown"
+DEFAULT_SOURCE_PRIORITY = 8
+DEFAULT_SOURCE_AUTHORITY_SCORE = 5
+DEFAULT_PREFERRED_FOR_EXECUTIVE_SUMMARY = False
+DEFAULT_SOURCE_NOTES = "Unclassified source"
+
+def normalize_source_name(source_name: str) -> str:
+    """Normalize Google News publisher display names for registry matching."""
+    if not source_name:
+        return ""
+    name = source_name.lower().strip()
+    name = re.sub(r"\s+", " ", name)
+    name = name.replace("&amp;", "&")
+    return name
+
+
+def extract_domain(url: str) -> str:
+    """
+    Extract clean lowercase domain from a URL.
+    Works for real publisher URLs and Google News redirect URLs.
+    """
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().strip()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
+
+
+def domain_matches(article_domain: str, registry_domain: str) -> bool:
+    """
+    Match exact domain or subdomain.
+    e.g. infra.economictimes.indiatimes.com matches economictimes.indiatimes.com
+    """
+    if not article_domain or not registry_domain:
+        return False
+    article_domain = article_domain.lower().strip()
+    registry_domain = registry_domain.lower().strip()
+    return article_domain == registry_domain or article_domain.endswith("." + registry_domain)
+
+
+def source_name_matches(article_source_name: str, registry_source_name: str) -> bool:
+    """
+    Match Google News publisher display names.
+    Normalized exact match first, then a conservative contains match
+    (only for registry names >= 5 chars, to avoid short-name false positives).
+    """
+    if not article_source_name or not registry_source_name:
+        return False
+    article_name = normalize_source_name(article_source_name)
+    registry_name = normalize_source_name(registry_source_name)
+    if article_name == registry_name:
+        return True
+    if len(registry_name) >= 5 and registry_name in article_name:
+        return True
+    return False
+
+
+def classify_source(url: str, source_name: str = None) -> dict:
+    """
+    Classify an article's source using publisher display name first,
+    then the URL domain.
+
+    Order of precedence:
+      1. source_name match  -> Google News gives us the publisher name even
+                               when the link is a news.google.com redirect.
+      2. domain match       -> only trustworthy when a real publisher URL is
+                               available; SKIPPED for redirect hosts when a
+                               source_name is present, so an unrecognized
+                               publisher does not get mislabeled as aggregator.
+      3. unknown defaults.
+    """
+    domain = extract_domain(url)
+
+    # 1. Prefer source_name matching (Google News links are redirects).
+    if source_name:
+        for entry in SOURCE_REGISTRY:
+            for registered_source_name in entry.get("source_names", []):
+                if source_name_matches(source_name, registered_source_name):
+                    return {
+                        "source_domain": domain,
+                        "source_type": entry["source_type"],
+                        "source_category": entry["source_category"],
+                        "source_priority": entry["source_priority"],
+                        "source_authority_score": entry["source_authority_score"],
+                        "preferred_for_executive_summary": entry["preferred_for_executive_summary"],
+                        "source_notes": entry["source_notes"],
+                        "source_match_method": "source_name"
+                    }
+
+    # 2. Domain fallback — only when we actually have a real publisher domain.
+    #    Skip redirect hosts (e.g. news.google.com) when a source_name exists,
+    #    so an unknown publisher falls through to unknown rather than aggregator.
+    skip_domain = (domain in REDIRECT_HOSTS) and bool(source_name)
+    if domain and not skip_domain:
+        for entry in SOURCE_REGISTRY:
+            for registered_domain in entry.get("domains", []):
+                if domain_matches(domain, registered_domain):
+                    return {
+                        "source_domain": domain,
+                        "source_type": entry["source_type"],
+                        "source_category": entry["source_category"],
+                        "source_priority": entry["source_priority"],
+                        "source_authority_score": entry["source_authority_score"],
+                        "preferred_for_executive_summary": entry["preferred_for_executive_summary"],
+                        "source_notes": entry["source_notes"],
+                        "source_match_method": "domain"
+                    }
+
+    # 3. Unknown fallback.
+    return {
+        "source_domain": domain,
+        "source_type": DEFAULT_SOURCE_TYPE,
+        "source_category": DEFAULT_SOURCE_CATEGORY,
+        "source_priority": DEFAULT_SOURCE_PRIORITY,
+        "source_authority_score": DEFAULT_SOURCE_AUTHORITY_SCORE,
+        "preferred_for_executive_summary": DEFAULT_PREFERRED_FOR_EXECUTIVE_SUMMARY,
+        "source_notes": DEFAULT_SOURCE_NOTES,
+        "source_match_method": "default"
+    }
 
 def load_keywords_from_excel():
     """Load SBU and Competitor keywords from Excel file"""
@@ -253,7 +579,15 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 sbu = "General"  # Let LLM decide relevance instead of dropping
             
             seen_links.add(link)
-            
+
+            # Classify source authority/reliability (metadata only — never filters articles)
+            source_metadata = classify_source(link, source)
+            logging.debug(
+                f"Source classified: source='{source}', domain='{source_metadata['source_domain']}', "
+                f"type='{source_metadata['source_type']}', score={source_metadata['source_authority_score']}, "
+                f"match_method='{source_metadata['source_match_method']}'"
+            )
+
             all_articles.append({
                 "search_keyword": keyword,
                 "news_title": title,
@@ -262,7 +596,15 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 "published_date": pubdate,
                 "sbu": sbu,
                 "competitor": competitor,
-                "content": ""
+                "content": "",
+                "source_domain": source_metadata["source_domain"],
+                "source_type": source_metadata["source_type"],
+                "source_category": source_metadata["source_category"],
+                "source_priority": source_metadata["source_priority"],
+                "source_authority_score": source_metadata["source_authority_score"],
+                "preferred_for_executive_summary": source_metadata["preferred_for_executive_summary"],
+                "source_notes": source_metadata["source_notes"],
+                "source_match_method": source_metadata["source_match_method"],
             })
     
     logging.info(f"Successfully fetched {successful_fetches}/{len(competitor_keywords)} feeds")
