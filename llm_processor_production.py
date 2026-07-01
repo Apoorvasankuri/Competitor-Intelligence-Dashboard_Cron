@@ -183,6 +183,11 @@ def save_to_processed_articles(df: pd.DataFrame):
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS preferred_for_executive_summary BOOLEAN DEFAULT FALSE;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_notes TEXT;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_match_method TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS search_query_type TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS detected_client_authority TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS detected_strategic_theme TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS search_query TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS accepted_by_gate TEXT;
     # ------------------------------------------------------------------
     insert_query = """
     INSERT INTO processed_articles (
@@ -212,11 +217,14 @@ def save_to_processed_articles(df: pd.DataFrame):
         source_match_method,
         search_query_type,
         detected_client_authority,
-        detected_strategic_theme
+        detected_strategic_theme,
+        search_query,
+        accepted_by_gate
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s
+        %s, %s, %s,
+        %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -264,6 +272,8 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('search_query_type', 'competitor'),
                 row.get('detected_client_authority', ''),
                 row.get('detected_strategic_theme', ''),
+                row.get('search_query'),
+                row.get('accepted_by_gate', ''),
             ))
             conn.commit()
             # Delete from raw after successful save
