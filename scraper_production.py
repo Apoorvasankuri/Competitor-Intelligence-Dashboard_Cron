@@ -38,6 +38,45 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 ]
 
+# ============================================================
+# Multi-lens search keyword lists (Change 4: exhaustiveness)
+# These drive non-competitor query lenses so we catch tender / policy /
+# authority / strategic-theme news that may not name a competitor.
+# ============================================================
+CLIENT_AUTHORITY_KEYWORDS = [
+    "Power Grid Corporation of India", "POWERGRID", "PGCIL", "NTPC", "SECI",
+    "NHAI", "MoRTH", "Indian Railways", "Railway Board", "RVNL", "IRCON",
+    "DMRC", "Delhi Metro", "MMRDA", "Mumbai Metro", "BMRCL", "Bangalore Metro",
+    "Chennai Metro", "CMRL", "NHSRCL", "GAIL", "ONGC", "Indian Oil", "IOCL",
+    "BPCL", "HPCL", "REC", "PFC", "CEA", "CERC"
+]
+
+STRATEGIC_THEME_KEYWORDS = [
+    "transmission tender", "transmission project", "TBCB transmission",
+    "tariff based competitive bidding", "ISTS project", "inter-state transmission",
+    "substation contract", "HVDC project", "765 kV transmission", "400 kV transmission",
+    "Green Energy Corridor", "renewable energy evacuation", "BESS tender",
+    "battery energy storage tender", "solar EPC contract", "wind EPC contract",
+    "railway electrification contract", "Kavach tender", "metro rail contract",
+    "metro civil package", "metro depot contract", "high speed rail package",
+    "oil pipeline contract", "gas pipeline EPC", "water pipeline EPC",
+    "data center construction contract", "airport construction contract",
+    "industrial construction EPC"
+]
+
+# ------------------------------------------------------------
+# Query-generation caps (Change 4: controlled rollout)
+# Conservative for the first production run to avoid Google News
+# throttling and to measure yield before scaling up. Tune here — do NOT
+# hardcode these deep inside generate_search_queries().
+# ------------------------------------------------------------
+MAX_INDIVIDUAL_SBU_QUERIES = 75
+MAX_COMPETITOR_SBU_QUERIES = 100
+MAX_COMPETITOR_CLIENT_QUERIES = 75
+MAX_SBU_CLIENT_QUERIES = 60
+MAX_TOTAL_SEARCH_QUERIES = 400
+]
+
 
 # ============================================================
 # Source Registry
@@ -520,6 +559,139 @@ def detect_competitor(title: str, source: str, competitor_to_sbu: Dict, competit
     return ", ".join(sorted(detected_competitors)) if detected_competitors else ""
 
 
+def detect_client_authority(text: str, client_keywords: List[str]) -> str:
+    """Return comma-separated client/authority keywords found in text (case-insensitive)."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    matched = set()
+    for kw in client_keywords:
+        if kw and kw.lower() in lowered:
+            matched.add(kw)
+    return ", ".join(sorted(matched)) if matched else ""
+
+
+def detect_strategic_theme(text: str, theme_keywords: List[str]) -> str:
+    """Return comma-separated strategic-theme keywords found in text (case-insensitive)."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    matched = set()
+    for kw in theme_keywords:
+        if kw and kw.lower() in lowered:
+            matched.add(kw)
+    return ", ".join(sorted(matched)) if matched else ""
+
+
+def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:
+    """
+    Build multi-lens Google News search queries for broader recall.
+
+    Returns a list of {"query": str, "query_type": str} objects.
+    query_type is one of:
+        competitor, client_authority, strategic_theme, sbu,
+        sbu_client, competitor_client, competitor_sbu
+
+    PRIORITY ORDER (matters because of the global MAX_TOTAL_SEARCH_QUERIES cap):
+        1. competitor          2. client_authority    3. strategic_theme
+        4. sbu                 5. sbu_client          6. competitor_client
+        7. competitor_sbu
+    High-value non-competitor lenses come before narrow competitor combos, so
+    if the total budget is exhausted, the low-yield combos get truncated first.
+
+    Per-type caps are the module-level MAX_* constants. Queries are de-duplicated
+    case-insensitively; the first (higher-priority) lens to produce a given query
+    string wins its query_type.
+    """
+    comp = [c.strip() for c in competitor_keywords if c and c.strip()]
+    sbu = [s.strip() for s in sbu_keywords if s and s.strip() and len(s.strip()) >= 3]
+
+    queries = []
+    seen = set()
+
+    def add(q: str, qtype: str) -> bool:
+        """Add one query if unique and under the global cap. Returns False if the
+        global cap is reached (signal to stop generating)."""
+        if len(queries) >= MAX_TOTAL_SEARCH_QUERIES:
+            return False
+        if not q:
+            return True
+        key = q.strip().lower()
+        if not key or key in seen:
+            return True
+        seen.add(key)
+        queries.append({"query": q.strip(), "query_type": qtype})
+        return True
+
+    # Each lens is a generator of (query, type); we consume them in priority order
+    # and stop entirely once the global cap is hit.
+    def lens_competitor():
+        for c in comp:
+            yield (c, "competitor")
+
+    def lens_client_authority():
+        for ca in CLIENT_AUTHORITY_KEYWORDS:
+            yield (ca, "client_authority")
+
+    def lens_strategic_theme():
+        for th in STRATEGIC_THEME_KEYWORDS:
+            yield (th, "strategic_theme")
+
+    def lens_sbu():
+        for s in sbu[:MAX_INDIVIDUAL_SBU_QUERIES]:
+            yield (s, "sbu")
+
+    def lens_sbu_client():
+        n = 0
+        for s in sbu:
+            for ca in CLIENT_AUTHORITY_KEYWORDS:
+                if n >= MAX_SBU_CLIENT_QUERIES:
+                    return
+                yield (f"{s} {ca}", "sbu_client")
+                n += 1
+
+    def lens_competitor_client():
+        n = 0
+        for c in comp:
+            for ca in CLIENT_AUTHORITY_KEYWORDS:
+                if n >= MAX_COMPETITOR_CLIENT_QUERIES:
+                    return
+                yield (f"{c} {ca}", "competitor_client")
+                n += 1
+
+    def lens_competitor_sbu():
+        n = 0
+        for c in comp:
+            for s in sbu:
+                if n >= MAX_COMPETITOR_SBU_QUERIES:
+                    return
+                yield (f"{c} {s}", "competitor_sbu")
+                n += 1
+
+    # Consume lenses strictly in priority order.
+    prioritized_lenses = [
+        lens_competitor,          # 1
+        lens_client_authority,    # 2
+        lens_strategic_theme,     # 3
+        lens_sbu,                 # 4
+        lens_sbu_client,          # 5
+        lens_competitor_client,   # 6
+        lens_competitor_sbu,      # 7
+    ]
+
+    for lens in prioritized_lenses:
+        stopped = False
+        for q, qtype in lens():
+            if not add(q, qtype):
+                stopped = True
+                break
+        if stopped:
+            logging.info("Query generation hit MAX_TOTAL_SEARCH_QUERIES=%s at lens '%s'",
+                         MAX_TOTAL_SEARCH_QUERIES, qtype)
+            break
+
+    return queries
+
 async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int, semaphore: asyncio.Semaphore) -> Dict:
     """Asynchronously fetch RSS feed with rate limiting and retry logic"""
     query = f"{keyword} when:{lookback_days}d"
@@ -583,12 +755,30 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
     timeout = aiohttp.ClientTimeout(total=120)
 
+    # Build multi-lens search queries (competitor + SBU + client + theme + combos)
+    search_queries = generate_search_queries(competitor_keywords, sbu_keywords)
+    query_to_type = {}
+    for q in search_queries:
+        query_to_type.setdefault(q["query"], q["query_type"])
+
+    query_type_counts = {}
+    for q in search_queries:
+        query_type_counts[q["query_type"]] = query_type_counts.get(q["query_type"], 0) + 1
+    logging.info("Generated %s Google News search queries", len(search_queries))
+    logging.info("Search query type distribution: %s", query_type_counts)
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [fetch_feed_async(session, kw, lookback_days, semaphore) for kw in competitor_keywords]
+        tasks = [fetch_feed_async(session, q["query"], lookback_days, semaphore) for q in search_queries]
         logging.info(f"Fetching {len(tasks)} RSS feeds (max {MAX_CONCURRENT_REQUESTS} concurrent)...")
-        results = await asyncio.gather(*tasks)    
+        results = await asyncio.gather(*tasks)
     # Process results
     successful_fetches = 0
+    accepted_competitor_led_articles = 0
+    accepted_non_competitor_signal_articles = 0
+    dropped_no_competitor_for_competitor_query = 0
+    dropped_no_signal_for_non_competitor_query = 0
+    accepted_by_type = {}
+    dropped_by_type = {}
     for result in results:
         if not result['success'] or not result['feed'] or not result['feed'].entries:
             continue
@@ -609,11 +799,13 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             
             # Extract source
             source = ""
+            desc_text = ""
             if "description" in entry:
                 soup = BeautifulSoup(entry.description, "html.parser")
                 font_tag = soup.find("font")
                 if font_tag:
                     source = font_tag.text.strip()
+                desc_text = soup.get_text(" ", strip=True)
             # Clean title by removing source suffix
             title = raw_title
             if source:
@@ -638,16 +830,42 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             if link in seen_links:
                 continue
             
-            # Detect competitor (must match to proceed)
+            # ---- Detect all signals (competitor detection still runs; it is now
+            #      conditional per query type, not a hard gate for every lens) ----
             competitor = detect_competitor(title, source, competitor_to_sbu, competitor_keywords)
-            if not competitor:
-                continue
-            
-            # Detect SBU (must match at least one SBU keyword)
             sbu = detect_sbu(title, source, sbu_keywords)
+            searchable_text = f"{title} {source} {desc_text}"
+            client_authority = detect_client_authority(searchable_text, CLIENT_AUTHORITY_KEYWORDS)
+            strategic_theme = detect_strategic_theme(searchable_text, STRATEGIC_THEME_KEYWORDS)
+
+            query_type = query_to_type.get(keyword, "competitor")
+
+            # ---- Query-type-aware acceptance ----
+            if query_type in ("competitor", "competitor_sbu", "competitor_client"):
+                # Competitor-led lenses: a competitor MUST be present.
+                if not competitor:
+                    dropped_no_competitor_for_competitor_query += 1
+                    dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    continue
+                accepted_competitor_led_articles += 1
+                accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+            else:
+                # Non-competitor lenses (client_authority, strategic_theme, sbu, sbu_client):
+                # accept on ANY relevance signal — SBU, client/authority, or strategic theme.
+                # These carry tender / policy / authority / pipeline intelligence and must
+                # NOT be dropped just because no competitor is named.
+                if not (sbu or client_authority or strategic_theme):
+                    dropped_no_signal_for_non_competitor_query += 1
+                    dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    continue
+                if not competitor:
+                    competitor = "-"
+                accepted_non_competitor_signal_articles += 1
+                accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+
             if not sbu:
                 sbu = "General"  # Let LLM decide relevance instead of dropping
-            
+
             seen_links.add(link)
 
             # Classify source authority/reliability (metadata only — never filters articles)
@@ -658,14 +876,22 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 f"match_method='{source_metadata['source_match_method']}'"
             )
 
+            # TODO: Add search_query_type / detected_client_authority /
+            #       detected_strategic_theme columns to raw_scraped_articles in a
+            #       later schema update. For now these ride on the dict and are
+            #       ignored by the (explicit-column) insert in save_to_database().
             all_articles.append({
                 "search_keyword": keyword,
+                "search_query": keyword,
+                "search_query_type": query_type,
+                "detected_client_authority": client_authority or "",
+                "detected_strategic_theme": strategic_theme or "",
                 "news_title": title,
                 "source": source,
                 "link": link,
                 "published_date": pubdate,
-                "sbu": sbu,
-                "competitor": competitor,
+                "sbu": sbu or "General",
+                "competitor": competitor or "-",
                 "content": "",
                 "source_domain": source_metadata["source_domain"],
                 "source_type": source_metadata["source_type"],
@@ -678,7 +904,24 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             })
     
     logging.info(f"Successfully fetched {successful_fetches}/{len(competitor_keywords)} feeds")
-    logging.info(f"Found {len(all_articles)} relevant articles (with competitors AND SBU match)")
+    logging.info(f"Found {len(all_articles)} relevant articles (multi-lens acceptance)")
+    logging.info(
+        "Acceptance summary: competitor_led=%s, non_competitor_signal=%s, "
+        "dropped_no_competitor=%s, dropped_no_signal=%s",
+        accepted_competitor_led_articles,
+        accepted_non_competitor_signal_articles,
+        dropped_no_competitor_for_competitor_query,
+        dropped_no_signal_for_non_competitor_query,
+    )
+    logging.info("Accepted by query_type: %s", accepted_by_type)
+    logging.info("Dropped by query_type: %s", dropped_by_type)
+    # Yield per 100 queries generated, by query_type — the key rollout signal:
+    # tells you which lenses are worth their fetch budget.
+    yield_per_100 = {}
+    for qtype, qcount in query_type_counts.items():
+        acc = accepted_by_type.get(qtype, 0)
+        yield_per_100[qtype] = round((acc / qcount) * 100, 1) if qcount else 0.0
+    logging.info("Accepted per 100 queries by query_type: %s", yield_per_100)
 
     # Do not filter articles based on source authority here.
     # Low-authority sources are still useful for recall.
