@@ -126,9 +126,13 @@ def detect_competitor(title: str, source: str, competitor_to_sbu: Dict, competit
 
 async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int, semaphore: asyncio.Semaphore) -> Dict:
     """Asynchronously fetch RSS feed with rate limiting and retry logic"""
-    encoded_keyword = quote(keyword)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}+when:{lookback_days}d&hl=en-IN&gl=IN&ceid=IN:en"
-    
+    query = f"{keyword} when:{lookback_days}d"
+    encoded_query = quote(query)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    logging.info(f"Fetching Google News RSS for keyword: {keyword}")
+    logging.debug(f"RSS URL: {rss_url}")
+
     headers = {
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
