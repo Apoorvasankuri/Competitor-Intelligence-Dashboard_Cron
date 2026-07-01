@@ -81,7 +81,12 @@ def load_raw_articles() -> pd.DataFrame:
             source_authority_score,
             preferred_for_executive_summary,
             source_notes,
-            source_match_method
+            source_match_method,
+            search_query_type,
+            detected_client_authority,
+            detected_strategic_theme,
+            search_query,
+            accepted_by_gate
         FROM raw_scraped_articles
         WHERE published_date = '{yesterday}'
         ORDER BY published_date DESC
@@ -121,10 +126,17 @@ def load_raw_articles() -> pd.DataFrame:
         "preferred_for_executive_summary": False,
         "source_notes": None,
         "source_match_method": "default",
+        "search_query_type": "competitor",
+        "detected_client_authority": "",
+        "detected_strategic_theme": "",
     }
     for col, default_value in source_defaults.items():
         if col not in df.columns:
             df[col] = default_value
+
+    df["search_query_type"] = df["search_query_type"].fillna("competitor")
+    df["detected_client_authority"] = df["detected_client_authority"].fillna("")
+    df["detected_strategic_theme"] = df["detected_strategic_theme"].fillna("")
 
     df["source_type"] = df["source_type"].fillna("unknown")
     df["source_category"] = df["source_category"].fillna("unknown")
@@ -133,7 +145,22 @@ def load_raw_articles() -> pd.DataFrame:
     df["preferred_for_executive_summary"] = df["preferred_for_executive_summary"].fillna(False)
     df["source_match_method"] = df["source_match_method"].fillna("default")
 
+    # Search-lens fields added in Change 4 Part B/C (search_query, accepted_by_gate).
+    search_lens_defaults = {
+        "search_query": None,
+        "accepted_by_gate": "",
+    }
+    for col, default_value in search_lens_defaults.items():
+        if col not in df.columns:
+            df[col] = default_value
+    df["accepted_by_gate"] = df["accepted_by_gate"].fillna("")
+
     logging.info(f"Loaded source metadata for {df['source_type'].notna().sum()} raw articles")
+    logging.info("Search query type distribution: %s",
+                 df["search_query_type"].value_counts(dropna=False).to_dict())
+    if "accepted_by_gate" in df.columns:
+        logging.info("Accepted-by-gate distribution: %s",
+                     df["accepted_by_gate"].value_counts(dropna=False).to_dict())
 
     return df
 
@@ -182,10 +209,14 @@ def save_to_processed_articles(df: pd.DataFrame):
         source_authority_score,
         preferred_for_executive_summary,
         source_notes,
-        source_match_method
+        source_match_method,
+        search_query_type,
+        detected_client_authority,
+        detected_strategic_theme
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -230,6 +261,9 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('preferred_for_executive_summary', False),
                 row.get('source_notes'),
                 row.get('source_match_method', 'default'),
+                row.get('search_query_type', 'competitor'),
+                row.get('detected_client_authority', ''),
+                row.get('detected_strategic_theme', ''),
             ))
             conn.commit()
             # Delete from raw after successful save

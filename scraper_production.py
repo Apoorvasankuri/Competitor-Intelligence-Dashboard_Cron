@@ -841,6 +841,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             query_type = query_to_type.get(keyword, "competitor")
 
             # ---- Query-type-aware acceptance ----
+            accepted_by_gate = ""
             if query_type in ("competitor", "competitor_sbu", "competitor_client"):
                 # Competitor-led lenses: a competitor MUST be present.
                 if not competitor:
@@ -849,6 +850,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                     continue
                 accepted_competitor_led_articles += 1
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+                accepted_by_gate = "competitor_detected"
             else:
                 # Non-competitor lenses (client_authority, strategic_theme, sbu, sbu_client):
                 # accept on ANY relevance signal — SBU, client/authority, or strategic theme.
@@ -862,6 +864,21 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                     competitor = "-"
                 accepted_non_competitor_signal_articles += 1
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+
+                # Record WHICH non-competitor signal(s) let this article through.
+                non_competitor_signals = []
+                if sbu and sbu != "General":
+                    non_competitor_signals.append("sbu_detected")
+                if client_authority:
+                    non_competitor_signals.append("client_authority_detected")
+                if strategic_theme:
+                    non_competitor_signals.append("strategic_theme_detected")
+                if len(non_competitor_signals) > 1:
+                    accepted_by_gate = "multiple_non_competitor_signals"
+                elif len(non_competitor_signals) == 1:
+                    accepted_by_gate = non_competitor_signals[0]
+                else:
+                    accepted_by_gate = ""
 
             if not sbu:
                 sbu = "General"  # Let LLM decide relevance instead of dropping
@@ -886,6 +903,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 "search_query_type": query_type,
                 "detected_client_authority": client_authority or "",
                 "detected_strategic_theme": strategic_theme or "",
+                "accepted_by_gate": accepted_by_gate,
                 "news_title": title,
                 "source": source,
                 "link": link,
@@ -980,17 +998,29 @@ def save_to_database(articles: List[Dict]):
     #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_notes TEXT;
     #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_match_method TEXT;
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # SQL schema update required (run once before deploying this change):
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS search_query TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS search_query_type TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS detected_client_authority TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS detected_strategic_theme TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS accepted_by_gate TEXT;
+    # ------------------------------------------------------------------
     insert_query = """
         INSERT INTO raw_scraped_articles (
             search_keyword, news_title, source, link, published_date,
             sbu, competitor, content,
             source_domain, source_type, source_category, source_priority,
             source_authority_score, preferred_for_executive_summary,
-            source_notes, source_match_method
+            source_notes, source_match_method,
+            search_query_type, detected_client_authority, detected_strategic_theme,
+            search_query, accepted_by_gate
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s,
+            %s, %s,
+            %s, %s, %s,
             %s, %s
         )
         ON CONFLICT (link, published_date) DO NOTHING
@@ -1019,6 +1049,11 @@ def save_to_database(articles: List[Dict]):
                 article.get("preferred_for_executive_summary", False),
                 article.get("source_notes"),
                 article.get("source_match_method", "default"),
+                article.get("search_query_type", "unknown"),
+                article.get("detected_client_authority", ""),
+                article.get("detected_strategic_theme", ""),
+                article.get("search_query") or article.get("search_keyword"),
+                article.get("accepted_by_gate", ""),
             ))
             conn.commit()  # Commit after each successful insert
             cur.close()
