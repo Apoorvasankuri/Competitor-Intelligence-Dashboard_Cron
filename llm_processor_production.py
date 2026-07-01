@@ -1273,7 +1273,13 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
     logging.info(f"   API calls made: {total_batches} (was {len(df)} before optimization)")
     logging.info(f"   High relevance (≥{RELEVANCE_THRESHOLD}): {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
     logging.info(f"   Will proceed to full analysis: {len(high_relevance)} articles")
-    
+
+    # Change 4 Part D (optional): which lenses survive Stage 1 relevance scoring.
+    # Diagnostics only — does not change filtering behavior.
+    if "search_query_type" in df.columns:
+        logging.info("Post-Stage-1 search_query_type distribution (survivors): %s",
+                     high_relevance["search_query_type"].value_counts(dropna=False).to_dict())
+
     return df
 
 def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map: Dict[str, int]) -> pd.DataFrame:

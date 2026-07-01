@@ -17,6 +17,7 @@ import random
 import re
 import pandas as pd
 from typing import List, Dict, Set
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -749,6 +750,19 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     """Scrape news asynchronously for all competitor keywords"""
     all_articles = []
     seen_links = set()
+
+    # Run-level yield analytics by query_type (Change 4 Part D) — diagnostics only,
+    # does not affect acceptance/ranking/dedup decisions.
+    query_stats = defaultdict(lambda: {
+        "queries_generated": 0,
+        "fetch_attempts": 0,
+        "fetch_success": 0,
+        "fetch_failed": 0,
+        "raw_items_seen": 0,
+        "accepted": 0,
+        "dropped": 0,
+        "duplicate_link_skips": 0
+    })
     
     # Create aiohttp session
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -764,11 +778,14 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     query_type_counts = {}
     for q in search_queries:
         query_type_counts[q["query_type"]] = query_type_counts.get(q["query_type"], 0) + 1
+        query_stats[q["query_type"]]["queries_generated"] += 1
     logging.info("Generated %s Google News search queries", len(search_queries))
     logging.info("Search query type distribution: %s", query_type_counts)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = [fetch_feed_async(session, q["query"], lookback_days, semaphore) for q in search_queries]
+        for q in search_queries:
+            query_stats[q["query_type"]]["fetch_attempts"] += 1
         logging.info(f"Fetching {len(tasks)} RSS feeds (max {MAX_CONCURRENT_REQUESTS} concurrent)...")
         results = await asyncio.gather(*tasks)
     # Process results
@@ -780,12 +797,20 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     accepted_by_type = {}
     dropped_by_type = {}
     for result in results:
+        keyword = result['keyword']
+        query_type = query_to_type.get(keyword, "competitor")
+
+        if result['success']:
+            query_stats[query_type]["fetch_success"] += 1
+        else:
+            query_stats[query_type]["fetch_failed"] += 1
+
         if not result['success'] or not result['feed'] or not result['feed'].entries:
             continue
         
         successful_fetches += 1
-        keyword = result['keyword']
         feed = result['feed']
+        query_stats[query_type]["raw_items_seen"] += len(feed.entries)
         
         for entry in feed.entries:
             raw_title = entry.get("title", "")
@@ -828,6 +853,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     
             # Skip duplicates
             if link in seen_links:
+                query_stats[query_type]["duplicate_link_skips"] += 1
                 continue
             
             # ---- Detect all signals (competitor detection still runs; it is now
@@ -838,8 +864,6 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             client_authority = detect_client_authority(searchable_text, CLIENT_AUTHORITY_KEYWORDS)
             strategic_theme = detect_strategic_theme(searchable_text, STRATEGIC_THEME_KEYWORDS)
 
-            query_type = query_to_type.get(keyword, "competitor")
-
             # ---- Query-type-aware acceptance ----
             accepted_by_gate = ""
             if query_type in ("competitor", "competitor_sbu", "competitor_client"):
@@ -847,9 +871,11 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 if not competitor:
                     dropped_no_competitor_for_competitor_query += 1
                     dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    query_stats[query_type]["dropped"] += 1
                     continue
                 accepted_competitor_led_articles += 1
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+                query_stats[query_type]["accepted"] += 1
                 accepted_by_gate = "competitor_detected"
             else:
                 # Non-competitor lenses (client_authority, strategic_theme, sbu, sbu_client):
@@ -859,11 +885,13 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 if not (sbu or client_authority or strategic_theme):
                     dropped_no_signal_for_non_competitor_query += 1
                     dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    query_stats[query_type]["dropped"] += 1
                     continue
                 if not competitor:
                     competitor = "-"
                 accepted_non_competitor_signal_articles += 1
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+                query_stats[query_type]["accepted"] += 1
 
                 # Record WHICH non-competitor signal(s) let this article through.
                 non_competitor_signals = []
@@ -955,6 +983,44 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
         source_match_method_counts[mm] = source_match_method_counts.get(mm, 0) + 1
     logging.info("Source type distribution: %s", source_type_counts)
     logging.info("Source match method distribution: %s", source_match_method_counts)
+
+    # ── Change 4 Part D: run-level yield analytics by query_type ──────────────
+    # Diagnostics only — used to tune query caps, not to filter/rank/dedup.
+    for qtype, stats in query_stats.items():
+        raw_seen = stats["raw_items_seen"]
+        accepted = stats["accepted"]
+        acceptance_rate = round((accepted / raw_seen) * 100, 2) if raw_seen else 0
+
+        logging.info(
+            "Query type '%s': generated=%s, fetch_attempts=%s, success=%s, failed=%s, "
+            "raw_seen=%s, accepted=%s, dropped=%s, duplicate_skips=%s, acceptance_rate=%s%%",
+            qtype,
+            stats["queries_generated"],
+            stats["fetch_attempts"],
+            stats["fetch_success"],
+            stats["fetch_failed"],
+            stats["raw_items_seen"],
+            stats["accepted"],
+            stats["dropped"],
+            stats["duplicate_link_skips"],
+            acceptance_rate
+        )
+
+    total_queries = sum(s["queries_generated"] for s in query_stats.values())
+    total_accepted = sum(s["accepted"] for s in query_stats.values())
+    total_dropped = sum(s["dropped"] for s in query_stats.values())
+    top_3_by_accepted = sorted(
+        query_stats.items(), key=lambda kv: kv[1]["accepted"], reverse=True
+    )[:3]
+
+    logging.info(
+        "Run-level yield summary: total_queries=%s, total_accepted=%s, total_dropped=%s",
+        total_queries, total_accepted, total_dropped
+    )
+    logging.info(
+        "Top 3 query types by accepted count: %s",
+        [(qtype, stats["accepted"]) for qtype, stats in top_3_by_accepted]
+    )
 
     return all_articles
 
