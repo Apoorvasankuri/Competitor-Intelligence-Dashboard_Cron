@@ -130,7 +130,8 @@ SOURCE_REGISTRY = [
             "Construction World", "Projects Today", "India Infrastructure",
             "Infrastructure Today", "Construction Week India", "ET Infra",
             "Urban Transport News", "Rail Analysis", "Metro Rail News",
-            "Railway Technology", "Global Railway Review", "International Railway Journal"
+            "Railway Technology", "Global Railway Review", "International Railway Journal",
+            "News on Projects", "New Civil Engineer", "Construction Enquirer"
         ],
         "domains": [
             "constructionworld.in", "projectstoday.com", "indiainfrastructure.com",
@@ -149,8 +150,10 @@ SOURCE_REGISTRY = [
         "source_category": "sector_media",
         "source_names": [
             "ET EnergyWorld", "Power Line", "Power Today", "Power Technology",
-            "T&D World", "PV Magazine India", "Mercom India", "Saur Energy",
-            "Renewable Watch", "SolarQuarter", "Energy Storage News"
+            "T&D World", "T&D India", "PV Magazine India", "Mercom India", "Saur Energy",
+            "Renewable Watch", "SolarQuarter", "Energy Storage News",
+            "Transformer Magazine", "Energetica India Magazine", "Solarbytes",
+            "Power Peak Digest", "CleanTechnica", "Electrek"
         ],
         "domains": [
             "energy.economictimes.indiatimes.com", "powerline.net.in",
@@ -169,8 +172,8 @@ SOURCE_REGISTRY = [
         "source_names": [
             "Economic Times", "The Economic Times", "Business Standard", "Mint",
             "Livemint", "Moneycontrol", "Financial Express", "The Hindu BusinessLine",
-            "BusinessLine", "CNBCTV18", "Zee Business", "Business Today",
-            "NDTV Profit", "Reuters", "Bloomberg", "Financial Times"
+            "BusinessLine", "CNBCTV18", "CNBC TV18", "Zee Business", "Business Today",
+            "NDTV Profit", "ET Now", "Rediff MoneyWiz", "Reuters", "Bloomberg", "Financial Times"
         ],
         "domains": [
             "economictimes.indiatimes.com", "business-standard.com", "livemint.com",
@@ -204,7 +207,7 @@ SOURCE_REGISTRY = [
         "source_category": "aggregator",
         "source_names": [
             "Google News", "Yahoo Finance", "Yahoo News", "MSN", "AOL",
-            "Devdiscourse", "LatestLY", "Big News Network"
+            "Devdiscourse", "LatestLY", "Big News Network", "Dailyhunt", "inkl"
         ],
         "domains": [
             "news.google.com", "yahoo.com", "msn.com", "aol.com",
@@ -220,12 +223,17 @@ SOURCE_REGISTRY = [
         "source_category": "low_authority",
         "source_names": [
             "openPR.com", "EIN News", "SBWire", "Digital Journal", "MENAFN",
-            "Benzinga", "Simply Wall St", "StockTitan", "MarketsMojo", "Equity Bulls"
+            "Benzinga", "Simply Wall St", "StockTitan", "MarketsMojo", "Equity Bulls",
+            "Whalesbook", "TradingView", "Upstox", "HDFC Sky", "Trade Brains",
+            "Goodreturns", "TipRanks", "ClearTax", "IndexBox", "AD HOC NEWS",
+            "MarketWatch", "Business Upturn", "Equitypandit"
         ],
         "domains": [
             "openpr.com", "einnews.com", "sbwire.com", "digitaljournal.com",
             "menafn.com", "benzinga.com", "simplywall.st", "stocktitan.net",
-            "marketsmojo.com", "equitybulls.com"
+            "marketsmojo.com", "equitybulls.com",
+            "scanx.trade", "sahi.com", "marketscreener.com", "biginfo.in",
+            "megaproject.com", "energynews.pro"
         ],
         "source_priority": 7,
         "source_authority_score": 5,
@@ -302,6 +310,18 @@ def source_name_matches(article_source_name: str, registry_source_name: str) -> 
     return False
 
 
+def looks_like_domain(name: str) -> bool:
+    """
+    True if a publisher 'name' is actually a bare domain, e.g. 'financialexpress.com'
+    or 'Mercomindia.com'. Google News sometimes puts the domain in the publisher slot
+    instead of a display name.
+    """
+    if not name:
+        return False
+    name = name.strip().lower()
+    return ("." in name) and (" " not in name)
+
+
 def classify_source(url: str, source_name: str = None) -> dict:
     """
     Classify an article's source using publisher display name first,
@@ -332,6 +352,28 @@ def classify_source(url: str, source_name: str = None) -> dict:
                         "preferred_for_executive_summary": entry["preferred_for_executive_summary"],
                         "source_notes": entry["source_notes"],
                         "source_match_method": "source_name"
+                    }
+
+    # 1b. Domain-shaped publisher name (e.g. "financialexpress.com", "Mercomindia.com").
+    #     Google News sometimes returns the bare domain as the publisher name. Match it
+    #     against the registry's DOMAINS list so that data does work even though the
+    #     article link is a news.google.com redirect. Also recovers the real domain.
+    if source_name and looks_like_domain(source_name):
+        name_as_domain = source_name.strip().lower()
+        if name_as_domain.startswith("www."):
+            name_as_domain = name_as_domain[4:]
+        for entry in SOURCE_REGISTRY:
+            for registered_domain in entry.get("domains", []):
+                if domain_matches(name_as_domain, registered_domain):
+                    return {
+                        "source_domain": name_as_domain,
+                        "source_type": entry["source_type"],
+                        "source_category": entry["source_category"],
+                        "source_priority": entry["source_priority"],
+                        "source_authority_score": entry["source_authority_score"],
+                        "preferred_for_executive_summary": entry["preferred_for_executive_summary"],
+                        "source_notes": entry["source_notes"],
+                        "source_match_method": "domain_from_source_name"
                     }
 
     # 2. Domain fallback — only when we actually have a real publisher domain.
