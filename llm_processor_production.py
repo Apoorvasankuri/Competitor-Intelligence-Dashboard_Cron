@@ -73,7 +73,15 @@ def load_raw_articles() -> pd.DataFrame:
             source,
             search_keyword,
             link,
-            content
+            content,
+            source_domain,
+            source_type,
+            source_category,
+            source_priority,
+            source_authority_score,
+            preferred_for_executive_summary,
+            source_notes,
+            source_match_method
         FROM raw_scraped_articles
         WHERE published_date = '{yesterday}'
         ORDER BY published_date DESC
@@ -101,7 +109,32 @@ def load_raw_articles() -> pd.DataFrame:
         'source': 'Source',
         'published_date': 'Published Date'
     })
-    
+
+    # Defensive: guarantee source-metadata columns exist even if the raw
+    # table predates the source-registry migration or a value is NULL.
+    source_defaults = {
+        "source_domain": None,
+        "source_type": "unknown",
+        "source_category": "unknown",
+        "source_priority": 8,
+        "source_authority_score": 5,
+        "preferred_for_executive_summary": False,
+        "source_notes": None,
+        "source_match_method": "default",
+    }
+    for col, default_value in source_defaults.items():
+        if col not in df.columns:
+            df[col] = default_value
+
+    df["source_type"] = df["source_type"].fillna("unknown")
+    df["source_category"] = df["source_category"].fillna("unknown")
+    df["source_priority"] = df["source_priority"].fillna(8)
+    df["source_authority_score"] = df["source_authority_score"].fillna(5)
+    df["preferred_for_executive_summary"] = df["preferred_for_executive_summary"].fillna(False)
+    df["source_match_method"] = df["source_match_method"].fillna("default")
+
+    logging.info(f"Loaded source metadata for {df['source_type'].notna().sum()} raw articles")
+
     return df
 
 
@@ -113,6 +146,17 @@ def save_to_processed_articles(df: pd.DataFrame):
     
     conn = get_db_connection()
     
+    # ------------------------------------------------------------------
+    # SQL schema update required (run once before deploying this change):
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_domain TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_type TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_category TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_priority INTEGER DEFAULT 8;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_authority_score INTEGER DEFAULT 5;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS preferred_for_executive_summary BOOLEAN DEFAULT FALSE;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_notes TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS source_match_method TEXT;
+    # ------------------------------------------------------------------
     insert_query = """
     INSERT INTO processed_articles (
         published_date,
@@ -130,9 +174,18 @@ def save_to_processed_articles(df: pd.DataFrame):
         competitor_tier,
         rank_score,
         fingerprint,
-        is_duplicate
+        is_duplicate,
+        source_domain,
+        source_type,
+        source_category,
+        source_priority,
+        source_authority_score,
+        preferred_for_executive_summary,
+        source_notes,
+        source_match_method
     ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -168,7 +221,15 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('competitor_tier'),
                 row.get('rank_score', 0),
                 fp_json,
-                is_dup
+                is_dup,
+                row.get('source_domain'),
+                row.get('source_type', 'unknown'),
+                row.get('source_category', 'unknown'),
+                row.get('source_priority', 8),
+                row.get('source_authority_score', 5),
+                row.get('preferred_for_executive_summary', False),
+                row.get('source_notes'),
+                row.get('source_match_method', 'default'),
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -1077,8 +1138,23 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
 
     value_points = value_tier * 5
 
+    # 6. SOURCE AUTHORITY (minimal, temporary integration — full ranking redesign comes later)
+    #    Better sources add more points; low-authority sources add only a little.
+    source_authority_score = row.get("source_authority_score", 5)
+    try:
+        source_authority_score = int(source_authority_score) if source_authority_score is not None else 5
+    except Exception:
+        source_authority_score = 5
+
     # TOTAL RANK SCORE
-    total_rank = category_points + relevance_points + competitor_points + geography_points + value_points
+    total_rank = (
+        category_points
+        + relevance_points
+        + competitor_points
+        + geography_points
+        + value_points
+        + source_authority_score
+    )
 
     return {
         'rank_score': total_rank,
@@ -1087,7 +1163,8 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
         'relevance_points': relevance_points,
         'competitor_points': competitor_points,
         'geography_points': geography_points,
-        'value_points': value_points
+        'value_points': value_points,
+        'source_authority_points': source_authority_score
     }
 
 # ============================================================================

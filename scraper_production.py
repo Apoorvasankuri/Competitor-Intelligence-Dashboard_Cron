@@ -640,13 +640,30 @@ def save_to_database(articles: List[Dict]):
         logging.info("No articles in date range")
         return    
     conn = get_db_connection()
-    
+
+    # ------------------------------------------------------------------
+    # SQL migration required (run once before deploying this change):
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_domain TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_type TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_category TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_priority INTEGER DEFAULT 8;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_authority_score INTEGER DEFAULT 5;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS preferred_for_executive_summary BOOLEAN DEFAULT FALSE;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_notes TEXT;
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS source_match_method TEXT;
+    # ------------------------------------------------------------------
     insert_query = """
         INSERT INTO raw_scraped_articles (
-            search_keyword, news_title, source, link, published_date, 
-            sbu, competitor, content
+            search_keyword, news_title, source, link, published_date,
+            sbu, competitor, content,
+            source_domain, source_type, source_category, source_priority,
+            source_authority_score, preferred_for_executive_summary,
+            source_notes, source_match_method
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s,
+            %s, %s
         )
         ON CONFLICT (link, published_date) DO NOTHING
     """
@@ -665,7 +682,15 @@ def save_to_database(articles: List[Dict]):
                 article['published_date'],
                 article['sbu'],
                 article['competitor'],
-                article['content']
+                article['content'],
+                article.get("source_domain"),
+                article.get("source_type", "unknown"),
+                article.get("source_category", "unknown"),
+                article.get("source_priority", 8),
+                article.get("source_authority_score", 5),
+                article.get("preferred_for_executive_summary", False),
+                article.get("source_notes"),
+                article.get("source_match_method", "default"),
             ))
             conn.commit()  # Commit after each successful insert
             cur.close()
