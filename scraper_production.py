@@ -77,6 +77,24 @@ MAX_COMPETITOR_CLIENT_QUERIES = 75
 MAX_SBU_CLIENT_QUERIES = 60
 MAX_TOTAL_SEARCH_QUERIES = 400
 
+SITE_OFFICIAL_QUERY_TYPES = (
+    "site_official_exchange",
+    "site_company_official",
+    "site_client_authority",
+    "site_government_policy",
+    "site_tender",
+)
+SITE_SPECIALIST_QUERY_TYPE = "site_specialist_media"
+
+SITE_QUERY_GATE_LABELS = {
+    "site_official_exchange": "site_official_exchange_query",
+    "site_company_official": "site_company_official_query",
+    "site_client_authority": "site_client_authority_query",
+    "site_government_policy": "site_government_policy_query",
+    "site_tender": "site_tender_query",
+    "site_specialist_media": "site_specialist_media_query",
+}
+
 
 
 # ============================================================
@@ -794,6 +812,10 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     accepted_non_competitor_signal_articles = 0
     dropped_no_competitor_for_competitor_query = 0
     dropped_no_signal_for_non_competitor_query = 0
+    # Change 4 Part E: site-specific / high-authority query counters.
+    accepted_by_site_query_without_signal = 0
+    accepted_by_site_query_with_signal = 0
+    dropped_site_specialist_no_signal = 0
     accepted_by_type = {}
     dropped_by_type = {}
     for result in results:
@@ -866,6 +888,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
 
             # ---- Query-type-aware acceptance ----
             accepted_by_gate = ""
+            needs_llm_relevance_validation = False  # set True by site-specific gates (Part E)
             if query_type in ("competitor", "competitor_sbu", "competitor_client"):
                 # Competitor-led lenses: a competitor MUST be present.
                 if not competitor:
@@ -877,6 +900,58 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
                 query_stats[query_type]["accepted"] += 1
                 accepted_by_gate = "competitor_detected"
+            elif query_type in SITE_OFFICIAL_QUERY_TYPES:
+                # Change 4 Part E — official/high-authority site: lenses.
+                # Recall-first: the query already targets an authoritative domain,
+                # so accept by DEFAULT even when the title carries no competitor/
+                # SBU/client/theme keyword (official titles are often generic, e.g.
+                # "Outcome of Board Meeting", "Cabinet approves"). Relevance is
+                # validated downstream by the LLM processor.
+                has_signal = bool(
+                    competitor or (sbu and sbu != "General")
+                    or client_authority or strategic_theme
+                )
+
+                # Per-type competitor/SBU defaults.
+                if query_type == "site_government_policy":
+                    competitor = "-"  # policy news is not competitor-attributed
+                elif not competitor:
+                    competitor = "-"
+                if not sbu:
+                    sbu = "General"
+
+                base_label = SITE_QUERY_GATE_LABELS[query_type]
+                if has_signal:
+                    accepted_by_gate = base_label + "_with_signal"
+                    accepted_by_site_query_with_signal += 1
+                else:
+                    accepted_by_gate = base_label + "_no_title_signal"
+                    accepted_by_site_query_without_signal += 1
+
+                needs_llm_relevance_validation = True
+                accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+                query_stats[query_type]["accepted"] += 1
+            elif query_type == SITE_SPECIALIST_QUERY_TYPE:
+                # Change 4 Part E — specialist media: useful but less authoritative
+                # than official sources, so require at least one title-level signal.
+                has_signal = bool(
+                    competitor or (sbu and sbu != "General")
+                    or client_authority or strategic_theme
+                )
+                if not has_signal:
+                    dropped_site_specialist_no_signal += 1
+                    dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    query_stats[query_type]["dropped"] += 1
+                    continue
+                if not competitor:
+                    competitor = "-"
+                if not sbu:
+                    sbu = "General"
+                accepted_by_gate = SITE_QUERY_GATE_LABELS[query_type] + "_with_signal"
+                accepted_by_site_query_with_signal += 1
+                needs_llm_relevance_validation = True
+                accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
+                query_stats[query_type]["accepted"] += 1
             else:
                 # Non-competitor lenses (client_authority, strategic_theme, sbu, sbu_client):
                 # accept on ANY relevance signal — SBU, client/authority, or strategic theme.
@@ -932,6 +1007,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 "detected_client_authority": client_authority or "",
                 "detected_strategic_theme": strategic_theme or "",
                 "accepted_by_gate": accepted_by_gate,
+                "needs_llm_relevance_validation": needs_llm_relevance_validation,
                 "news_title": title,
                 "source": source,
                 "link": link,
@@ -958,6 +1034,13 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
         accepted_non_competitor_signal_articles,
         dropped_no_competitor_for_competitor_query,
         dropped_no_signal_for_non_competitor_query,
+    )
+    logging.info(
+        "Site-query acceptance (Part E): accepted_without_signal=%s, "
+        "accepted_with_signal=%s, dropped_specialist_no_signal=%s",
+        accepted_by_site_query_without_signal,
+        accepted_by_site_query_with_signal,
+        dropped_site_specialist_no_signal,
     )
     logging.info("Accepted by query_type: %s", accepted_by_type)
     logging.info("Dropped by query_type: %s", dropped_by_type)
