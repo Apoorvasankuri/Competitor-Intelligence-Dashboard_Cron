@@ -95,6 +95,41 @@ SITE_QUERY_GATE_LABELS = {
     "site_specialist_media": "site_specialist_media_query",
 }
 
+# High-authority domains targeted via site: filters (Change 4 Part E).
+OFFICIAL_EXCHANGE_DOMAINS = [
+    "bseindia.com",
+    "nseindia.com",
+]
+COMPANY_OFFICIAL_DOMAINS = [
+    "larsentoubro.com", "tataprojects.com", "kalpataruprojects.com",
+    "sterlitepower.com", "ircon.org", "rvnl.org", "afcons.com",
+    "hccindia.com", "ncclimited.com", "pncinfra.com", "dilipbuildcon.com",
+    "ashokabuildcon.com", "grinfra.com", "siemens-energy.com",
+    "hitachienergy.com", "sterlingandwilsonre.com", "tatapower.com",
+    "transrail.in",
+]
+CLIENT_AUTHORITY_DOMAINS = [
+    "powergrid.in", "pgcilindia.com", "ntpc.co.in", "nhai.gov.in",
+    "seci.co.in", "dmrc.org", "indianrailways.gov.in", "nhsrcl.in",
+    "gailonline.com", "ongcindia.com", "iocl.com",
+]
+GOVERNMENT_POLICY_DOMAINS = [
+    "pib.gov.in", "powermin.gov.in", "mnre.gov.in", "morth.nic.in",
+    "railways.gov.in", "cea.nic.in", "cercind.gov.in",
+]
+TENDER_DOMAINS = [
+    "eprocure.gov.in", "gem.gov.in", "ireps.gov.in", "etenders.gov.in",
+]
+SPECIALIST_MEDIA_DOMAINS = [
+    "constructionworld.in", "projectstoday.com",
+    "infra.economictimes.indiatimes.com", "energy.economictimes.indiatimes.com",
+    "railanalysis.com", "metrorailnews.in", "mercomindia.com",
+    "pv-magazine-india.com", "renewablewatch.in",
+]
+
+# Cap so site-specific lenses cannot crowd out base lenses under the global budget.
+MAX_SITE_SPECIFIC_QUERIES = 80
+
 
 
 # ============================================================
@@ -711,6 +746,53 @@ def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[s
 
     return queries
 
+def generate_site_specific_queries() -> List[Dict]:
+    """
+    Change 4 Part E: build site-targeted Google News RSS queries against
+    high-authority domains. Each query pairs a single domain with a compact
+    intent-term OR-group so recall stays high while article volume stays sane
+    (one query per domain, NOT a domain x keyword cross-product).
+
+    Returns a list of {"query": str, "query_type": str} objects using the
+    six site_* query types the Part E gate expects.
+
+    Controlled by MAX_SITE_SPECIFIC_QUERIES so these lenses cannot crowd out
+    the base lenses under the global budget.
+    """
+    # Broad intent OR-group: infra/EPC business events. Kept generic on purpose
+    # so official filings/press releases are not excluded by narrow phrasing;
+    # the LLM processor validates true relevance downstream.
+    intent = ('contract OR order OR tender OR bid OR award OR project OR '
+              'EPC OR transmission OR substation OR pipeline OR "letter of award" OR '
+              'commissioning OR "financial results" OR acquisition')
+
+    tiers = [
+        (OFFICIAL_EXCHANGE_DOMAINS, "site_official_exchange"),
+        (COMPANY_OFFICIAL_DOMAINS, "site_company_official"),
+        (CLIENT_AUTHORITY_DOMAINS, "site_client_authority"),
+        (GOVERNMENT_POLICY_DOMAINS, "site_government_policy"),
+        (TENDER_DOMAINS, "site_tender"),
+        (SPECIALIST_MEDIA_DOMAINS, "site_specialist_media"),
+    ]
+
+    site_queries = []
+    seen = set()
+    for domains, qtype in tiers:
+        for domain in domains:
+            if len(site_queries) >= MAX_SITE_SPECIFIC_QUERIES:
+                logging.info("Site-query generation hit MAX_SITE_SPECIFIC_QUERIES=%s at tier '%s'",
+                             MAX_SITE_SPECIFIC_QUERIES, qtype)
+                return site_queries
+            d = (domain or "").strip().lower()
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            site_queries.append({
+                "query": f"site:{d} ({intent})",
+                "query_type": qtype,
+            })
+    return site_queries
+
 async def fetch_feed_async(session: aiohttp.ClientSession, keyword: str, lookback_days: int, semaphore: asyncio.Semaphore) -> Dict:
     """Asynchronously fetch RSS feed with rate limiting and retry logic"""
     query = f"{keyword} when:{lookback_days}d"
@@ -788,7 +870,21 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     timeout = aiohttp.ClientTimeout(total=120)
 
     # Build multi-lens search queries (competitor + SBU + client + theme + combos)
-    search_queries = generate_search_queries(competitor_keywords, sbu_keywords)
+    base_queries = generate_search_queries(competitor_keywords, sbu_keywords)
+
+    # Change 4 Part E: append site-targeted high-authority queries, de-duplicated
+    # against the base set (base wins on any collision, keeping its query_type).
+    site_queries = generate_site_specific_queries()
+    search_queries = list(base_queries)
+    _seen_queries = {q["query"].strip().lower() for q in search_queries}
+    for sq in site_queries:
+        key = sq["query"].strip().lower()
+        if key and key not in _seen_queries:
+            _seen_queries.add(key)
+            search_queries.append(sq)
+    logging.info("Query mix: base=%s, site_specific=%s, total=%s",
+                 len(base_queries), len(site_queries), len(search_queries))
+
     query_to_type = {}
     for q in search_queries:
         query_to_type.setdefault(q["query"], q["query_type"])
@@ -908,7 +1004,8 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 # "Outcome of Board Meeting", "Cabinet approves"). Relevance is
                 # validated downstream by the LLM processor.
                 has_signal = bool(
-                    competitor or (sbu and sbu != "General")
+                    (competitor and competitor != "-")
+                    or (sbu and sbu != "General")
                     or client_authority or strategic_theme
                 )
 
@@ -935,7 +1032,8 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 # Change 4 Part E — specialist media: useful but less authoritative
                 # than official sources, so require at least one title-level signal.
                 has_signal = bool(
-                    competitor or (sbu and sbu != "General")
+                    (competitor and competitor != "-")
+                    or (sbu and sbu != "General")
                     or client_authority or strategic_theme
                 )
                 if not has_signal:
@@ -1007,6 +1105,8 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 "detected_client_authority": client_authority or "",
                 "detected_strategic_theme": strategic_theme or "",
                 "accepted_by_gate": accepted_by_gate,
+                # TODO: Persist needs_llm_relevance_validation if used downstream
+                # (add column to raw_scraped_articles + insert + processor SELECT).
                 "needs_llm_relevance_validation": needs_llm_relevance_validation,
                 "news_title": title,
                 "source": source,
