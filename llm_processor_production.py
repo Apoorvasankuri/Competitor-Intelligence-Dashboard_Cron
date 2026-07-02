@@ -1031,6 +1031,165 @@ def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
         pass
 
     return df
+# ============================================================
+# Change 5 Part G: event-level executive impact scoring.
+# Deterministic weights only. Defensive; never raises into the pipeline.
+# ============================================================
+def get_event_category_weight(category_tag):
+    """Weight for a category (normalized), default to 'unknown'."""
+    try:
+        if category_tag is None:
+            return EVENT_CATEGORY_IMPACT_WEIGHTS["unknown"]
+        key = str(category_tag).strip().lower()
+        return EVENT_CATEGORY_IMPACT_WEIGHTS.get(key, EVENT_CATEGORY_IMPACT_WEIGHTS["unknown"])
+    except Exception:
+        return EVENT_CATEGORY_IMPACT_WEIGHTS["unknown"]
+
+
+def get_max_competitor_tier_weight(competitor_tier_map, competitor_tagging):
+    """Max tier weight across a (possibly comma-separated) competitor field."""
+    try:
+        if not competitor_tagging or not competitor_tier_map:
+            return 0
+        best = 0
+        for comp in split_csv_field(competitor_tagging):
+            tier = competitor_tier_map.get(comp)
+            if tier is None:
+                tier = competitor_tier_map.get(str(comp).strip())
+            if tier is None:
+                continue
+            weight = COMPETITOR_TIER_WEIGHTS.get(int(tier), 0)
+            if weight > best:
+                best = weight
+        return best
+    except Exception:
+        return 0
+
+
+def get_deal_value_weight(value_inr_crore):
+    """First tier whose threshold <= value."""
+    try:
+        value = normalize_numeric_value(value_inr_crore)
+        if value is None or value == 0:
+            return 0
+        for threshold, weight in DEAL_VALUE_TIER_WEIGHTS:
+            if threshold <= value:
+                return weight
+        return 0
+    except Exception:
+        return 0
+
+
+def get_source_authority_weight(source_authority_score):
+    """First tier whose threshold <= source authority score."""
+    try:
+        score = normalize_numeric_value(source_authority_score)
+        if score is None:
+            score = 0
+        for threshold, weight in SOURCE_AUTHORITY_TIER_WEIGHTS:
+            if threshold <= score:
+                return weight
+        return 0
+    except Exception:
+        return 0
+
+
+def get_cluster_size_weight(cluster_article_count):
+    """First tier whose threshold <= cluster size."""
+    try:
+        count = normalize_numeric_value(cluster_article_count)
+        if count is None:
+            count = 1
+        for threshold, weight in CLUSTER_SIZE_TIER_WEIGHTS:
+            if threshold <= count:
+                return weight
+        return 0
+    except Exception:
+        return 0
+
+
+def get_freshness_weight(published_date):
+    """First tier whose threshold <= days_ago."""
+    try:
+        if published_date is None:
+            return 0
+        dt = pd.to_datetime(published_date, errors="coerce")
+        if pd.isna(dt):
+            return 0
+        now = pd.Timestamp.now()
+        if dt.tzinfo is not None:
+            now = pd.Timestamp.now(tz=dt.tzinfo)
+        days_ago = (now.normalize() - dt.normalize()).days
+        if days_ago < 0:
+            days_ago = 0
+        for threshold, weight in CLUSTER_FRESHNESS_WEIGHTS:
+            if threshold <= days_ago:
+                return weight
+        return 0
+    except Exception:
+        return 0
+
+
+def compute_event_impact_score(row, competitor_tier_map):
+    """Deterministic executive impact score for one row, capped at MAX_EVENT_IMPACT_SCORE."""
+    try:
+        get = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+        score = (
+            get_event_category_weight(get("category_tag"))
+            + get_max_competitor_tier_weight(competitor_tier_map, get("competitor_tagging"))
+            + get_deal_value_weight(get("contract_value_inr_crore"))
+            + get_source_authority_weight(get("source_authority_score"))
+            + get_cluster_size_weight(get("cluster_article_count"))
+            + get_freshness_weight(get("published_date"))
+        )
+        if score > MAX_EVENT_IMPACT_SCORE:
+            score = MAX_EVENT_IMPACT_SCORE
+        return int(score)
+    except Exception:
+        return 0
+
+
+def assign_event_impact_scores(df, competitor_tier_map):
+    """
+    Compute event_impact_score per row and overwrite cluster_rank_score with the
+    per-cluster max. Missing cluster_id is treated as its own single-article cluster.
+    Defensive: never raises.
+    """
+    try:
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+        df["event_impact_score"] = df.apply(
+            lambda r: compute_event_impact_score(r, competitor_tier_map), axis=1
+        )
+
+        if "cluster_rank_score" not in df.columns:
+            df["cluster_rank_score"] = 0
+
+        has_cluster = df["cluster_id"].notna() if "cluster_id" in df.columns else pd.Series(False, index=df.index)
+
+        if "cluster_id" in df.columns and has_cluster.any():
+            cluster_max = df[has_cluster].groupby("cluster_id")["event_impact_score"].transform("max")
+            df.loc[has_cluster, "cluster_rank_score"] = cluster_max
+
+        if (~has_cluster).any():
+            df.loc[~has_cluster, "cluster_rank_score"] = df.loc[~has_cluster, "event_impact_score"]
+
+        try:
+            number_of_unique_clusters = df["cluster_id"].nunique(dropna=True) if "cluster_id" in df.columns else 0
+            max_score = int(df["event_impact_score"].max()) if len(df) else 0
+            avg_score = round(float(df["event_impact_score"].mean()), 2) if len(df) else 0
+            logging.info("Event impact scores assigned. Clusters: %s | Max score: %s | Avg score: %s",
+                         number_of_unique_clusters, max_score, avg_score)
+        except Exception:
+            pass
+
+        return df
+    except Exception as e:
+        logging.warning("assign_event_impact_scores failed: %s", e)
+        return df
+
 def save_to_processed_articles(df: pd.DataFrame):
     """Save processed articles to processed_articles table"""
     if df.empty:
@@ -1143,14 +1302,16 @@ def save_to_processed_articles(df: pd.DataFrame):
         cluster_categories,
         cluster_primary_source,
         cluster_primary_source_type,
-        cluster_primary_url
+        cluster_primary_url,
+        event_impact_score
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s,
         %s, %s,
         %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -1215,6 +1376,7 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('cluster_primary_source', ''),
                 row.get('cluster_primary_source_type', ''),
                 row.get('cluster_primary_url', ''),
+                row.get('event_impact_score', 0),
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -3228,7 +3390,10 @@ def main():
         high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
 
     # Change 5 Part D: build deterministic cluster-level event fields
-    high_relevance_df = build_cluster_event_fields(high_relevance_df)
+    try:
+        high_relevance_df = assign_event_impact_scores(high_relevance_df, competitor_tier_map)
+    except Exception as e:
+        logging.warning("Event impact scoring failed, falling back to article rank_score for cluster_rank_score: %s", e)
 
     # Save to processed_articles table (only deduplicated high-relevance)
 
