@@ -46,6 +46,9 @@ RATE_LIMIT_DELAY = 0.15
 # Relevance threshold
 RELEVANCE_THRESHOLD = 70
 
+# Change 5 Part C: safety cap for O(n^2) in-memory event clustering.
+MAX_EVENT_CLUSTERING_ARTICLES = int(os.getenv("MAX_EVENT_CLUSTERING_ARTICLES", "500"))
+
 # ============================================================================
 # DATABASE FUNCTIONS
 # ============================================================================
@@ -356,6 +359,532 @@ def assign_event_clusters_scaffold(df: pd.DataFrame) -> pd.DataFrame:
     if "is_representative_article" not in df.columns:
         df["is_representative_article"] = True
     logging.info("Event clustering scaffold applied: %s articles marked as separate_event", len(df))
+    return df
+# ============================================================
+# Change 5 Part B: event fingerprint normalization + deterministic matching.
+# Reusable helpers only — NOT wired into the pipeline yet.
+# ============================================================
+
+# Fingerprint key aliases (fingerprints come from different LLM prompt versions).
+_FP_CLIENT_KEYS = ["client_or_authority", "client", "authority"]
+_FP_PROJECT_KEYS = ["project_name", "project", "scope"]
+_FP_VALUE_KEYS = ["contract_value_crore", "contract_value_inr_crore", "value_crore", "deal_value_crore"]
+_FP_LOCATION_KEYS = ["location", "geography"]
+_FP_BIDDER_KEYS = ["companies_bidding", "bidders"]
+_FP_PERIOD_KEYS = ["period", "quarter", "year"]
+_FP_REVENUE_KEYS = ["revenue", "revenue_crore", "total_income"]
+_FP_PROFIT_KEYS = ["profit", "net_profit", "pat", "profit_crore"]
+_FP_ORDERBOOK_KEYS = ["order_book", "order_book_crore", "orderbook"]
+_FP_ACQUIRER_KEYS = ["acquirer", "buyer"]
+_FP_TARGET_KEYS = ["target_company", "target", "asset"]
+_FP_DEALTYPE_KEYS = ["deal_type", "type"]
+_FP_SECTOR_KEYS = ["sector", "segment"]
+_FP_AUTHORITY_KEYS = ["authority", "regulator", "ministry"]
+_FP_POLICY_KEYS = ["policy_or_rule", "policy", "scheme", "topic"]
+_FP_MILESTONE_KEYS = ["milestone", "status", "completion_status"]
+
+
+def get_event_type(row) -> str:
+    """Return normalized event/category type for clustering."""
+    category = row.get("category_tag") if hasattr(row, "get") else getattr(row, "category_tag", None)
+    if category is None:
+        return "unknown"
+    return normalize_text_for_matching(category)
+
+
+def get_primary_competitor_set(row) -> set:
+    """Return normalized competitor set from competitor_tagging."""
+    value = row.get("competitor_tagging") if hasattr(row, "get") else None
+    competitors = split_csv_field(value)
+    return set(normalize_text_for_matching(c) for c in competitors if c)
+
+
+def get_sbu_set(row) -> set:
+    """Return normalized SBU set from sbu_tagging."""
+    value = row.get("sbu_tagging") if hasattr(row, "get") else None
+    sbus = split_csv_field(value)
+    return set(normalize_text_for_matching(s) for s in sbus if s)
+
+
+def get_fingerprint_dict(row) -> dict:
+    """Safely return event fingerprint dictionary from a row."""
+    raw = None
+    for col in ["_fingerprint", "event_fingerprint", "fingerprint"]:
+        try:
+            if hasattr(row, "get") and row.get(col) is not None:
+                raw = row.get(col)
+                break
+        except Exception:
+            pass
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def normalized_fingerprint_value(fp: dict, keys: list) -> str:
+    """Return first available normalized fingerprint value from a list of possible keys."""
+    if not fp:
+        return ""
+    for key in keys:
+        value = fp.get(key)
+        if value not in [None, "", "-"]:
+            return normalize_text_for_matching(value)
+    return ""
+
+
+def fingerprint_numeric_value(fp: dict, keys: list):
+    """Return first available numeric fingerprint value from possible keys."""
+    if not fp:
+        return None
+    for key in keys:
+        value = fp.get(key)
+        num = normalize_numeric_value(value)
+        if num is not None:
+            return num
+    return None
+
+
+def title_similarity(title1: str, title2: str) -> float:
+    """Return SequenceMatcher similarity between normalized titles."""
+    t1 = normalize_text_for_matching(title1)
+    t2 = normalize_text_for_matching(title2)
+    if not t1 or not t2:
+        return 0.0
+    return SequenceMatcher(None, t1, t2).ratio()
+
+
+def token_overlap_score(text1: str, text2: str) -> float:
+    """Return token overlap score based on non-stopword tokens."""
+    stop_words = {
+        "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "of", "with",
+        "by", "from", "is", "was", "are", "were", "has", "have", "had", "this",
+        "that", "these", "those", "ltd", "limited", "private", "company"
+    }
+    tokens1 = set(normalize_text_for_matching(text1).split()) - stop_words
+    tokens2 = set(normalize_text_for_matching(text2).split()) - stop_words
+    if not tokens1 or not tokens2:
+        return 0.0
+    return len(tokens1 & tokens2) / max(len(tokens1), len(tokens2))
+
+
+def _row_title(row) -> str:
+    """Best-effort title accessor across dict / Series / naming variants."""
+    if hasattr(row, "get"):
+        return row.get("news_title") or row.get("News Title") or row.get("title") or ""
+    return getattr(row, "news_title", "") or getattr(row, "title", "") or ""
+
+
+def _text_signals(row1, row2):
+    """Shared (title_similarity, token_overlap) for a row pair."""
+    t1, t2 = _row_title(row1), _row_title(row2)
+    return title_similarity(t1, t2), token_overlap_score(t1, t2)
+
+
+def match_order_win_event(row1, row2) -> bool:
+    """A. Order wins: competitor overlap AND >=2 corroborating signals."""
+    if not (get_primary_competitor_set(row1) & get_primary_competitor_set(row2)):
+        return False
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    ts, tok = _text_signals(row1, row2)
+    signals = 0
+    c1 = normalized_fingerprint_value(fp1, _FP_CLIENT_KEYS)
+    c2 = normalized_fingerprint_value(fp2, _FP_CLIENT_KEYS)
+    if c1 and c2 and (c1 == c2 or SequenceMatcher(None, c1, c2).ratio() > 0.75):
+        signals += 1
+    p1 = normalized_fingerprint_value(fp1, _FP_PROJECT_KEYS)
+    p2 = normalized_fingerprint_value(fp2, _FP_PROJECT_KEYS)
+    if p1 and p2 and (p1 == p2 or SequenceMatcher(None, p1, p2).ratio() > 0.70):
+        signals += 1
+    if values_close(fingerprint_numeric_value(fp1, _FP_VALUE_KEYS),
+                    fingerprint_numeric_value(fp2, _FP_VALUE_KEYS), 10):
+        signals += 1
+    l1 = normalized_fingerprint_value(fp1, _FP_LOCATION_KEYS)
+    l2 = normalized_fingerprint_value(fp2, _FP_LOCATION_KEYS)
+    if l1 and l2 and (l1 == l2 or SequenceMatcher(None, l1, l2).ratio() > 0.75):
+        signals += 1
+    if ts > 0.55 or tok > 0.45:
+        signals += 1
+    return signals >= 2
+
+
+def match_bidding_event(row1, row2) -> bool:
+    """B. Bidding: client/authority matches AND >=2 corroborating signals."""
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    c1 = normalized_fingerprint_value(fp1, _FP_CLIENT_KEYS)
+    c2 = normalized_fingerprint_value(fp2, _FP_CLIENT_KEYS)
+    if not (c1 and c2 and (c1 == c2 or SequenceMatcher(None, c1, c2).ratio() > 0.75)):
+        return False
+    ts, _ = _text_signals(row1, row2)
+    signals = 0
+    p1 = normalized_fingerprint_value(fp1, _FP_PROJECT_KEYS)
+    p2 = normalized_fingerprint_value(fp2, _FP_PROJECT_KEYS)
+    if p1 and p2 and (p1 == p2 or SequenceMatcher(None, p1, p2).ratio() > 0.70):
+        signals += 1
+    if values_close(fingerprint_numeric_value(fp1, _FP_VALUE_KEYS),
+                    fingerprint_numeric_value(fp2, _FP_VALUE_KEYS), 10):
+        signals += 1
+    l1 = normalized_fingerprint_value(fp1, _FP_LOCATION_KEYS)
+    l2 = normalized_fingerprint_value(fp2, _FP_LOCATION_KEYS)
+    if l1 and l2 and (l1 == l2 or SequenceMatcher(None, l1, l2).ratio() > 0.75):
+        signals += 1
+    bidders1 = get_primary_competitor_set(row1) | set(
+        normalize_text_for_matching(x) for x in split_csv_field(
+            fp1.get("companies_bidding") or fp1.get("bidders")))
+    bidders2 = get_primary_competitor_set(row2) | set(
+        normalize_text_for_matching(x) for x in split_csv_field(
+            fp2.get("companies_bidding") or fp2.get("bidders")))
+    if bidders1 & bidders2:
+        signals += 1
+    if ts > 0.55:
+        signals += 1
+    return signals >= 2
+
+
+def match_financial_event(row1, row2) -> bool:
+    """C. Financial: competitor overlap AND period matches AND one value/title signal."""
+    if not (get_primary_competitor_set(row1) & get_primary_competitor_set(row2)):
+        return False
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    per1 = normalized_fingerprint_value(fp1, _FP_PERIOD_KEYS)
+    per2 = normalized_fingerprint_value(fp2, _FP_PERIOD_KEYS)
+    if not (per1 and per2 and per1 == per2):
+        return False
+    ts, _ = _text_signals(row1, row2)
+    if values_close(fingerprint_numeric_value(fp1, _FP_REVENUE_KEYS),
+                    fingerprint_numeric_value(fp2, _FP_REVENUE_KEYS), 10):
+        return True
+    if values_close(fingerprint_numeric_value(fp1, _FP_PROFIT_KEYS),
+                    fingerprint_numeric_value(fp2, _FP_PROFIT_KEYS), 10):
+        return True
+    if values_close(fingerprint_numeric_value(fp1, _FP_ORDERBOOK_KEYS),
+                    fingerprint_numeric_value(fp2, _FP_ORDERBOOK_KEYS), 10):
+        return True
+    return ts > 0.55
+
+
+def match_ma_event(row1, row2) -> bool:
+    """D. M&A: (acquirer matches AND target matches) OR (title>0.70 AND competitor overlap)."""
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    a1 = normalized_fingerprint_value(fp1, _FP_ACQUIRER_KEYS)
+    a2 = normalized_fingerprint_value(fp2, _FP_ACQUIRER_KEYS)
+    t1 = normalized_fingerprint_value(fp1, _FP_TARGET_KEYS)
+    t2 = normalized_fingerprint_value(fp2, _FP_TARGET_KEYS)
+    acquirer_ok = a1 and a2 and (a1 == a2 or SequenceMatcher(None, a1, a2).ratio() > 0.75)
+    target_ok = t1 and t2 and (t1 == t2 or SequenceMatcher(None, t1, t2).ratio() > 0.75)
+    if acquirer_ok and target_ok:
+        return True
+    ts, _ = _text_signals(row1, row2)
+    if ts > 0.70 and (get_primary_competitor_set(row1) & get_primary_competitor_set(row2)):
+        return True
+    return False
+
+
+def match_partnership_event(row1, row2) -> bool:
+    """E. Partnership: overlapping companies AND one of deal_type/sector/project/title."""
+    if not (get_primary_competitor_set(row1) & get_primary_competitor_set(row2)):
+        return False
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    ts, _ = _text_signals(row1, row2)
+    dt1 = normalized_fingerprint_value(fp1, _FP_DEALTYPE_KEYS)
+    dt2 = normalized_fingerprint_value(fp2, _FP_DEALTYPE_KEYS)
+    if dt1 and dt2 and dt1 == dt2:
+        return True
+    s1 = normalized_fingerprint_value(fp1, _FP_SECTOR_KEYS)
+    s2 = normalized_fingerprint_value(fp2, _FP_SECTOR_KEYS)
+    if s1 and s2 and s1 == s2:
+        return True
+    p1 = normalized_fingerprint_value(fp1, _FP_PROJECT_KEYS)
+    p2 = normalized_fingerprint_value(fp2, _FP_PROJECT_KEYS)
+    if p1 and p2 and (p1 == p2 or SequenceMatcher(None, p1, p2).ratio() > 0.70):
+        return True
+    return ts > 0.60
+
+
+def match_policy_event(row1, row2) -> bool:
+    """F. Policy: (authority matches AND policy matches) OR (title>0.65 AND SBU overlap)."""
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    au1 = normalized_fingerprint_value(fp1, _FP_AUTHORITY_KEYS)
+    au2 = normalized_fingerprint_value(fp2, _FP_AUTHORITY_KEYS)
+    po1 = normalized_fingerprint_value(fp1, _FP_POLICY_KEYS)
+    po2 = normalized_fingerprint_value(fp2, _FP_POLICY_KEYS)
+    authority_ok = au1 and au2 and (au1 == au2 or SequenceMatcher(None, au1, au2).ratio() > 0.75)
+    policy_ok = po1 and po2 and (po1 == po2 or SequenceMatcher(None, po1, po2).ratio() > 0.70)
+    if authority_ok and policy_ok:
+        return True
+    ts, _ = _text_signals(row1, row2)
+    if ts > 0.65 and (get_sbu_set(row1) & get_sbu_set(row2)):
+        return True
+    return False
+
+
+def match_project_execution_event(row1, row2) -> bool:
+    """G. Project execution: competitor overlap AND project/location overlap AND milestone/title."""
+    if not (get_primary_competitor_set(row1) & get_primary_competitor_set(row2)):
+        return False
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    p1 = normalized_fingerprint_value(fp1, _FP_PROJECT_KEYS)
+    p2 = normalized_fingerprint_value(fp2, _FP_PROJECT_KEYS)
+    l1 = normalized_fingerprint_value(fp1, _FP_LOCATION_KEYS)
+    l2 = normalized_fingerprint_value(fp2, _FP_LOCATION_KEYS)
+    project_ok = p1 and p2 and (p1 == p2 or SequenceMatcher(None, p1, p2).ratio() > 0.70)
+    location_ok = l1 and l2 and (l1 == l2 or SequenceMatcher(None, l1, l2).ratio() > 0.75)
+    if not (project_ok or location_ok):
+        return False
+    m1 = normalized_fingerprint_value(fp1, _FP_MILESTONE_KEYS)
+    m2 = normalized_fingerprint_value(fp2, _FP_MILESTONE_KEYS)
+    ts, _ = _text_signals(row1, row2)
+    if m1 and m2 and m1 == m2:
+        return True
+    return ts > 0.60
+
+
+def match_generic_event(row1, row2) -> bool:
+    """H. Generic fallback."""
+    comp_overlap = bool(get_primary_competitor_set(row1) & get_primary_competitor_set(row2))
+    sbu_overlap = bool(get_sbu_set(row1) & get_sbu_set(row2))
+    ts, tok = _text_signals(row1, row2)
+    if comp_overlap and ts > 0.70:
+        return True
+    if tok > 0.60 and sbu_overlap:
+        return True
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+    if comp_overlap and values_close(fingerprint_numeric_value(fp1, _FP_VALUE_KEYS),
+                                     fingerprint_numeric_value(fp2, _FP_VALUE_KEYS), 10):
+        g1 = normalized_fingerprint_value(fp1, _FP_LOCATION_KEYS)
+        g2 = normalized_fingerprint_value(fp2, _FP_LOCATION_KEYS)
+        if g1 and g2 and (g1 == g2 or SequenceMatcher(None, g1, g2).ratio() > 0.75):
+            return True
+    return False
+
+
+def compare_event_relationship(row1, row2) -> str:
+    """Compare two processed article rows and return a relationship type."""
+    event_type_1 = get_event_type(row1)
+    event_type_2 = get_event_type(row2)
+
+    if event_type_1 != event_type_2:
+        # Different categories are usually separate,
+        # but allow related_context if titles are highly similar.
+        t1 = _row_title(row1)
+        t2 = _row_title(row2)
+        if title_similarity(t1, t2) > 0.75:
+            return RELATIONSHIP_RELATED_CONTEXT
+        return RELATIONSHIP_SEPARATE_EVENT
+
+    if event_type_1 == "order wins":
+        return RELATIONSHIP_SAME_EVENT if match_order_win_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "bidding activity":
+        return RELATIONSHIP_SAME_EVENT if match_bidding_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "financial":
+        return RELATIONSHIP_SAME_EVENT if match_financial_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "mergers & acquisitions":
+        return RELATIONSHIP_SAME_EVENT if match_ma_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "partnerships & alliances":
+        return RELATIONSHIP_SAME_EVENT if match_partnership_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "regulatory & policy":
+        return RELATIONSHIP_SAME_EVENT if match_policy_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if event_type_1 == "project execution":
+        return RELATIONSHIP_SAME_EVENT if match_project_execution_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+
+    return RELATIONSHIP_SAME_EVENT if match_generic_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+
+
+def test_event_matching_on_dataframe(df: pd.DataFrame, max_pairs: int = 100) -> dict:
+    """
+    Developer diagnostic helper. Compares the first max_pairs row pairs and returns
+    relationship counts. NOT called in the production pipeline yet.
+    """
+    counts = {rel: 0 for rel in RELATIONSHIP_TYPES}
+    if df is None or df.empty or len(df) < 2:
+        return counts
+    checked = 0
+    for i in range(len(df)):
+        for j in range(i + 1, len(df)):
+            if checked >= max_pairs:
+                return counts
+            rel = compare_event_relationship(df.iloc[i], df.iloc[j])
+            counts[rel] = counts.get(rel, 0) + 1
+            checked += 1
+    return counts
+# ============================================================
+# Change 5 Part C: in-memory event clustering of the final dataframe.
+# Annotates cluster_id / relationship_type / is_representative_article.
+# Does NOT write to event_clusters table.
+# ============================================================
+def get_row_title(row) -> str:
+    """Return best available title field for a row."""
+    if hasattr(row, "get"):
+        return (
+            row.get("news_title")
+            or row.get("News Title")
+            or row.get("title")
+            or row.get("newstitle")
+            or ""
+        )
+    return ""
+
+
+def get_row_date(row):
+    """Return best available published date field."""
+    if hasattr(row, "get"):
+        return (
+            row.get("published_date")
+            or row.get("Published Date")
+            or row.get("publishedate")
+            or row.get("date")
+        )
+    return None
+
+
+def safe_rank_score(row) -> int:
+    """Safely return rank_score as integer."""
+    try:
+        value = row.get("rank_score") if hasattr(row, "get") else None
+        if value is None:
+            return 0
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def safe_source_score(row) -> int:
+    """Safely return source_authority_score as integer."""
+    try:
+        value = row.get("source_authority_score") if hasattr(row, "get") else None
+        if value is None:
+            return 5
+        return int(float(value))
+    except Exception:
+        return 5
+
+
+def choose_representative_index(df: pd.DataFrame, indexes: list) -> int:
+    """
+    Choose representative article for a cluster.
+    Priority: source_authority_score > rank_score > preferred_for_executive_summary
+    > summary/title completeness > newer published_date.
+    """
+    if not indexes:
+        return None
+
+    def sort_key(idx):
+        row = df.loc[idx]
+        source_score = safe_source_score(row)
+        rank_score = safe_rank_score(row)
+        preferred = 0
+        try:
+            preferred = 1 if bool(row.get("preferred_for_executive_summary")) else 0
+        except Exception:
+            preferred = 0
+        summary_len = 0
+        try:
+            summary = row.get("summary") or row.get("kec_business_summary") or ""
+            title = get_row_title(row)
+            summary_len = len(str(summary)) + min(len(str(title)), 200)
+        except Exception:
+            summary_len = 0
+        date_value = get_row_date(row)
+        date_sort = pd.Timestamp.min
+        try:
+            if date_value is not None:
+                date_sort = pd.to_datetime(date_value, errors="coerce")
+                if pd.isna(date_sort):
+                    date_sort = pd.Timestamp.min
+        except Exception:
+            date_sort = pd.Timestamp.min
+        return (source_score, rank_score, preferred, summary_len, date_sort)
+
+    return sorted(indexes, key=sort_key, reverse=True)[0]
+
+
+def create_in_memory_event_clusters(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create event clusters in memory using compare_event_relationship().
+    Assigns local cluster_id (from 1), marks one representative per cluster,
+    sets relationship_type. Does NOT write to event_clusters table.
+    """
+    if df is None or df.empty:
+        return df
+
+    if len(df) > MAX_EVENT_CLUSTERING_ARTICLES:
+        logging.warning(
+            "Too many articles for in-memory O(n^2) clustering: %s. Falling back to scaffold.",
+            len(df)
+        )
+        return assign_event_clusters_scaffold(df)
+
+    df = df.copy()
+    df["cluster_id"] = None
+    df["relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
+    df["is_representative_article"] = False
+
+    clusters = []
+    cluster_id_counter = 1
+
+    for idx, row in df.iterrows():
+        assigned_cluster = None
+        assigned_relationship = RELATIONSHIP_SEPARATE_EVENT
+
+        for cluster in clusters:
+            representative_row = df.loc[cluster["representative_idx"]]
+            relationship = compare_event_relationship(row, representative_row)
+            if relationship in [
+                RELATIONSHIP_EXACT_DUPLICATE,
+                RELATIONSHIP_SAME_EVENT,
+                RELATIONSHIP_FOLLOW_ON_UPDATE,
+                RELATIONSHIP_COMMENTARY,
+            ]:
+                assigned_cluster = cluster
+                assigned_relationship = relationship
+                break
+
+        if assigned_cluster is None:
+            assigned_cluster = {
+                "cluster_id": cluster_id_counter,
+                "article_indexes": [idx],
+                "representative_idx": idx,
+            }
+            clusters.append(assigned_cluster)
+            df.at[idx, "cluster_id"] = cluster_id_counter
+            df.at[idx, "relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
+            cluster_id_counter += 1
+        else:
+            assigned_cluster["article_indexes"].append(idx)
+            df.at[idx, "cluster_id"] = assigned_cluster["cluster_id"]
+            df.at[idx, "relationship_type"] = assigned_relationship
+            new_rep = choose_representative_index(df, assigned_cluster["article_indexes"])
+            assigned_cluster["representative_idx"] = new_rep
+
+    for cluster in clusters:
+        rep_idx = cluster["representative_idx"]
+        if rep_idx is not None:
+            df.at[rep_idx, "is_representative_article"] = True
+
+    for cluster in clusters:
+        cluster_indexes = cluster["article_indexes"]
+        if not any(bool(df.at[i, "is_representative_article"]) for i in cluster_indexes):
+            df.at[cluster_indexes[0], "is_representative_article"] = True
+
+    total_articles = len(df)
+    total_clusters = len(clusters)
+    duplicate_or_related = total_articles - total_clusters
+    logging.info(
+        "In-memory event clustering complete: articles=%s, clusters=%s, grouped_articles=%s",
+        total_articles, total_clusters, duplicate_or_related
+    )
+    try:
+        relationship_counts = df["relationship_type"].value_counts(dropna=False).to_dict()
+        logging.info("Event relationship distribution: %s", relationship_counts)
+    except Exception:
+        pass
+
     return df
 
 def save_to_processed_articles(df: pd.DataFrame):
@@ -2508,8 +3037,12 @@ def main():
     log_gate_distribution(high_relevance_df, "Final articles before save")
     log_source_type_distribution(high_relevance_df, "Final articles before save")
 
-    # Change 5 Part A: apply event-clustering scaffold (safe defaults only)
-    high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
+    # Change 5 Part C: group final articles into in-memory event clusters
+    try:
+        high_relevance_df = create_in_memory_event_clusters(high_relevance_df)
+    except Exception as e:
+        logging.warning("Event clustering failed, falling back to scaffold: %s", e)
+        high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
 
     # Save to processed_articles table (only deduplicated high-relevance)
 
