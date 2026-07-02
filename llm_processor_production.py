@@ -755,39 +755,85 @@ Now analyze the provided article."""
 # STAGE 1: QUICK RELEVANCE SCORING
 # ============================================================================
 
-QUICK_SCORE_PROMPT = """You are an expert relevance scorer for KEC International's competitive intelligence system, serving senior management for strategic decision-making.
+QUICK_SCORE_PROMPT = """You are an expert relevance scorer for KEC International's competitive and market intelligence system, serving senior management for strategic decision-making.
+
+KEC's platform tracks TWO types of intelligence. Both are valuable. Do NOT require an article to name a competitor to be relevant.
 
 Competitors: L&T, Kalpataru, Sterlite, Tata Projects, NCC, Siemens, ABB, IRCON, RVNL, Shapoorji, PNC, Simplex, Sterling & Wilson, ReNew, Hero Future, etc.
 
 KEC'S CORE BUSINESSES:
-- Transmission & Distribution (T&D): Power lines, substations, grid infrastructure
-- Transportation: Railways, metro, monorail, signaling
-- Civil: Buildings, water treatment, industrial facilities, defense infrastructure
-- Renewables: Solar parks, wind farms, hybrid projects
-- Oil & Gas: Pipelines, terminals, storage facilities
+- Transmission & Distribution (T&D): power lines, substations, grid infrastructure
+- Transportation: railways, metro, monorail, signaling
+- Civil: buildings, water treatment, industrial facilities, defense infrastructure
+- Renewables: solar parks, wind farms, hybrid, BESS
+- Oil & Gas: pipelines, terminals, storage facilities
+
+TYPE A — COMPETITOR INTELLIGENCE:
+- competitor order wins
+- competitor bidding activity
+- competitor project execution
+- competitor M&A or partnerships
+- competitor capacity expansion
+- competitor financial / order-book commentary
+- competitor new market entry
+
+TYPE B — MARKET OPPORTUNITY INTELLIGENCE (often does NOT name a competitor):
+- tenders from project authorities (e.g. PGCIL, NTPC, SECI, NHAI, metro/rail bodies)
+- client / authority project announcements
+- government policy approvals
+- budget / capex allocations
+- regulatory schemes
+- transmission project pipeline
+- renewable / BESS tenders
+- metro / rail package announcements
+- oil & gas pipeline tenders
+- infrastructure project awards before the winner is known
+- official filings that may mention orders, contracts, LoA, order book, M&A, or project updates
 
 SCORING RULES (0-100):
 
-85-100: MUST ANALYZE
-- Competitor wins major EPC contract (₹500+ crore) in KEC sectors
-- Major M&A/JV in EPC/infra sectors
-- New market entry by competitor in KEC geographies
-- Government policy/budget allocation for T&D/Rail/Renewables/Infra
-- Technology developments in power transmission, rail systems
+90-100: CRITICAL INTELLIGENCE
+- Major competitor order win or bid in KEC sectors
+- Large tender / project package from a major client or authority
+- Official filing announcing a major order, LoA, contract, order-book, M&A, or capex
+- Government approval or policy materially affecting T&D, rail, metro, renewables, civil, or oil & gas
+- Major M&A / JV / strategic partnership in relevant sectors
+- Large BESS, Green Energy Corridor, transmission, metro, rail, civil, or pipeline opportunity
 
-70-84: TANGENTIALLY USEFUL
-- Competitor quarterly results IF they mention order book/projects
-- General sector commentary by industry bodies
-- Adjacent infrastructure if involves EPC work
+80-89: HIGH RELEVANCE
+- Medium-sized tender or project announcement in KEC sectors
+- Important client / authority update without a named winner
+- Competitor financials with order book, guidance, project pipeline, or segment commentary
+- Specialist media reporting a credible project pipeline or policy movement
+- New market entry by a relevant competitor or client
 
-20-39: WEAK RELEVANCE
-- Stock price movements with no project/operational news
-- Generic CSR/sustainability announcements
-- Awards/rankings without business impact
+70-79: USEFUL / MONITOR
+- Sector trend with direct relevance to KEC SBUs
+- Early-stage policy or project signal
+- Smaller but relevant project or tender
+- Company announcement that may require follow-up
+- Official source with a vague title but where query / source context suggests possible relevance
 
-0-19: IRRELEVANT
-- Competitor's unrelated businesses (IT services, finance, FMCG, retail)
-- Generic market/economy news with no sector specifics
+40-69: WEAK / CONTEXTUAL
+- Generic infrastructure or energy news with an indirect connection
+- Stock / market article with limited operational detail
+- Broad economy / capex commentary without specific project or SBU impact
+
+0-39: LOW RELEVANCE / NOISE
+- Stock price movement only
+- CSR, awards, HR, careers, routine board / admin update
+- Unrelated businesses
+- Generic market updates with no KEC-sector relevance
+- Unrelated subsidiaries or consumer / IT / finance activity
+
+HANDLING OFFICIAL / SOURCE-SPECIFIC ARTICLES:
+Each article includes context fields (Search Query, Search Query Type, Accepted By Gate, Source Type, Source Category, Source Authority Score, detected signals). For articles accepted through official / source-specific query types (search_query_type starting with "site_", or an accepted_by_gate indicating an official / exchange / authority / government / tender source):
+- Do NOT penalize the article merely because the title is vague.
+- Official filings and government announcements often have generic titles.
+- Use search_query, search_query_type, accepted_by_gate, source_type, source_category, source_authority_score, and the detected signals as context.
+- If the title is vague but the source / query context is strong, assign AT LEAST monitor-level relevance (70-79) unless the title clearly indicates routine noise.
+- Routine noise includes generic board meetings, HR / careers, CSR, stock-only, unrelated investor admin, or governance updates with no order / project / policy / capex relevance.
+- The later full-analysis stage can validate the details.
 
 You will be given a batch of articles. For each, return ONLY its relevance score (0-100).
 Return a JSON array of objects with "id" and "score" fields. No explanation."""
@@ -803,7 +849,21 @@ def batch_relevance_score(articles_batch: List[Dict]) -> List[int]:
     
     articles_text = ""
     for article in articles_batch:
-        articles_text += f"\n[{article['id']}] Title: {article['title']}\n    Competitor: {article['competitor']}\n"
+        articles_text += f"""
+ID: {article['id']}
+Title: {article.get('title', '')}
+Source: {article.get('source', '')}
+Search Query: {article.get('search_query', '')}
+Search Query Type: {article.get('search_query_type', 'competitor')}
+Accepted By Gate: {article.get('accepted_by_gate', '')}
+Detected Client/Authority: {article.get('detected_client_authority', '')}
+Detected Strategic Theme: {article.get('detected_strategic_theme', '')}
+Competitor: {article.get('competitor', '')}
+Source Type: {article.get('source_type', 'unknown')}
+Source Category: {article.get('source_category', 'unknown')}
+Source Authority Score: {article.get('source_authority_score', 5)}
+Needs LLM Relevance Validation: {article.get('needs_llm_relevance_validation', False)}
+"""
     
     prompt = f"""Score these {len(articles_batch)} articles for relevance (0-100 each):
 {articles_text}
@@ -1242,7 +1302,19 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
             articles_batch.append({
                 'id': local_idx + 1,
                 'title': str(row['News Title']),
-                'competitor': str(row.get('Competitor', ''))
+                'competitor': str(row.get('Competitor', '')),
+                # Change 4 Part F: pass search-lens + source context so Stage 1
+                # can score non-competitor market-opportunity articles fairly.
+                'source': str(row.get('Source', '')),
+                'search_query': str(row.get('search_query') or ''),
+                'search_query_type': str(row.get('search_query_type') or 'competitor'),
+                'accepted_by_gate': str(row.get('accepted_by_gate') or ''),
+                'detected_client_authority': str(row.get('detected_client_authority') or ''),
+                'detected_strategic_theme': str(row.get('detected_strategic_theme') or ''),
+                'source_type': str(row.get('source_type') or 'unknown'),
+                'source_category': str(row.get('source_category') or 'unknown'),
+                'source_authority_score': row.get('source_authority_score', 5),
+                'needs_llm_relevance_validation': row.get('needs_llm_relevance_validation', False),
             })
         all_batches.append((i, articles_batch))
     
