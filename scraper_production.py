@@ -30,6 +30,17 @@ LOOKBACK_DAYS = 15
 MAX_CONCURRENT_REQUESTS = 5  # Limit concurrent requests
 REQUEST_DELAY = 1  # Delay between requests in seconds
 EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
+
+# ------------------------------------------------------------
+# Change 4 Part H: dry-run mode (safe test run, no DB writes).
+# Dry-run usage:
+#   PowerShell: $env:DRY_RUN="true"; $env:DRY_RUN_MAX_QUERIES="30"; python scraper_production.py
+#   CMD:        set DRY_RUN=true && set DRY_RUN_MAX_QUERIES=30 && python scraper_production.py
+#   Bash:       DRY_RUN=true DRY_RUN_MAX_QUERIES=30 python scraper_production.py
+# ------------------------------------------------------------
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN_MAX_QUERIES = int(os.getenv("DRY_RUN_MAX_QUERIES", "30"))
+DRY_RUN_SAMPLE_ARTICLES = int(os.getenv("DRY_RUN_SAMPLE_ARTICLES", "15"))
 # Rotate User-Agents to avoid fingerprinting
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -885,6 +896,11 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     logging.info("Query mix: base=%s, site_specific=%s, total=%s",
                  len(base_queries), len(site_queries), len(search_queries))
 
+    if DRY_RUN:
+        logging.info("DRY RUN MODE ENABLED — database writes will be skipped")
+        logging.info("Limiting search queries to first %s queries", DRY_RUN_MAX_QUERIES)
+        search_queries = search_queries[:DRY_RUN_MAX_QUERIES]
+
     query_to_type = {}
     for q in search_queries:
         query_to_type.setdefault(q["query"], q["query_type"])
@@ -1217,6 +1233,29 @@ def get_db_connection():
     return psycopg.connect(database_url, row_factory=dict_row)
 
 
+def log_dry_run_samples(articles):
+    """Print a small sample of accepted articles for dry-run review (Change 4 Part H)."""
+    try:
+        if not articles:
+            logging.info("DRY RUN: no accepted articles to sample")
+            return
+        logging.info("DRY RUN: showing up to %s accepted article samples", DRY_RUN_SAMPLE_ARTICLES)
+        for i, article in enumerate(articles[:DRY_RUN_SAMPLE_ARTICLES], start=1):
+            logging.info(
+                "DRY RUN SAMPLE %s | title=%s | source=%s | query_type=%s | accepted_by=%s | competitor=%s | sbu=%s | source_type=%s",
+                i,
+                article.get("news_title"),
+                article.get("source"),
+                article.get("search_query_type"),
+                article.get("accepted_by_gate"),
+                article.get("competitor"),
+                article.get("sbu"),
+                article.get("source_type"),
+            )
+    except Exception as e:
+        logging.warning("Could not log dry-run samples: %s", e)
+
+
 def save_to_database(articles: List[Dict]):
     """Save scraped articles to PostgreSQL database - raw_scraped_articles table"""
     if not articles:
@@ -1344,7 +1383,16 @@ async def main_async():
     )
     
     # Save to database
-    save_to_database(articles)
+    if DRY_RUN:
+        logging.info("DRY RUN MODE: skipping database save")
+        log_dry_run_samples(articles)
+        logging.info("=" * 70)
+        logging.info("DRY RUN COMPLETE")
+        logging.info("Accepted articles: %s", len(articles))
+        logging.info("Database write: skipped")
+        logging.info("=" * 70)
+    else:
+        save_to_database(articles)
     
     logging.info("=" * 60)
     logging.info("Scraping Job Complete")

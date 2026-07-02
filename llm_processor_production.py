@@ -164,6 +164,106 @@ def load_raw_articles() -> pd.DataFrame:
 
     return df
 
+def log_query_type_distribution(df, label):
+    try:
+        if df is None or df.empty:
+            logging.info("%s: no articles", label)
+            return
+        if "search_query_type" not in df.columns:
+            logging.info("%s: search_query_type column not found", label)
+            return
+        distribution = df["search_query_type"].fillna("unknown").value_counts(dropna=False).to_dict()
+        logging.info("%s - search_query_type distribution: %s", label, distribution)
+    except Exception as e:
+        logging.warning("Could not log search_query_type distribution for %s: %s", label, e)
+
+
+def log_relevance_yield_by_query_type(df, label):
+    try:
+        if df is None or df.empty:
+            logging.info("%s: no articles", label)
+            return
+        if "search_query_type" not in df.columns or "relevance_score" not in df.columns:
+            logging.info("%s: required columns not found for relevance yield", label)
+            return
+        temp = df.copy()
+        temp["search_query_type"] = temp["search_query_type"].fillna("unknown")
+        temp["relevance_score"] = pd.to_numeric(temp["relevance_score"], errors="coerce").fillna(0)
+        grouped = temp.groupby("search_query_type").agg(
+            article_count=("relevance_score", "count"),
+            avg_relevance_score=("relevance_score", "mean"),
+            above_threshold=("relevance_score", lambda x: int((x >= RELEVANCE_THRESHOLD).sum()))
+        ).reset_index()
+        grouped["pass_rate_pct"] = (
+            grouped["above_threshold"] / grouped["article_count"] * 100
+        ).round(2)
+        logging.info("%s - relevance yield by query type:", label)
+        for _, row in grouped.sort_values("article_count", ascending=False).iterrows():
+            logging.info(
+                "query_type=%s | count=%s | avg_score=%.2f | above_threshold=%s | pass_rate=%s%%",
+                row["search_query_type"],
+                int(row["article_count"]),
+                float(row["avg_relevance_score"]),
+                int(row["above_threshold"]),
+                row["pass_rate_pct"]
+            )
+    except Exception as e:
+        logging.warning("Could not log relevance yield for %s: %s", label, e)
+
+
+def log_category_yield_by_query_type(df, label):
+    try:
+        if df is None or df.empty:
+            logging.info("%s: no articles", label)
+            return
+        if "search_query_type" not in df.columns or "category_tag" not in df.columns:
+            logging.info("%s: required columns not found for category yield", label)
+            return
+        temp = df.copy()
+        temp["search_query_type"] = temp["search_query_type"].fillna("unknown")
+        temp["category_tag"] = temp["category_tag"].fillna("unknown")
+        pivot = (
+            temp.groupby(["search_query_type", "category_tag"])
+            .size()
+            .reset_index(name="count")
+            .sort_values(["search_query_type", "count"], ascending=[True, False])
+        )
+        logging.info("%s - category yield by query type:", label)
+        for query_type in pivot["search_query_type"].unique():
+            subset = pivot[pivot["search_query_type"] == query_type].head(5)
+            summary = {row["category_tag"]: int(row["count"]) for _, row in subset.iterrows()}
+            logging.info("query_type=%s | top_categories=%s", query_type, summary)
+    except Exception as e:
+        logging.warning("Could not log category yield for %s: %s", label, e)
+
+
+def log_gate_distribution(df, label):
+    try:
+        if df is None or df.empty:
+            logging.info("%s: no articles", label)
+            return
+        if "accepted_by_gate" not in df.columns:
+            logging.info("%s: accepted_by_gate column not found", label)
+            return
+        distribution = df["accepted_by_gate"].fillna("unknown").value_counts(dropna=False).to_dict()
+        logging.info("%s - accepted_by_gate distribution: %s", label, distribution)
+    except Exception as e:
+        logging.warning("Could not log accepted_by_gate distribution for %s: %s", label, e)
+
+
+def log_source_type_distribution(df, label):
+    try:
+        if df is None or df.empty:
+            logging.info("%s: no articles", label)
+            return
+        if "source_type" not in df.columns:
+            logging.info("%s: source_type column not found", label)
+            return
+        distribution = df["source_type"].fillna("unknown").value_counts(dropna=False).to_dict()
+        logging.info("%s - source_type distribution: %s", label, distribution)
+    except Exception as e:
+        logging.warning("Could not log source_type distribution for %s: %s", label, e)
+
 
 def save_to_processed_articles(df: pd.DataFrame):
     """Save processed articles to processed_articles table"""
@@ -2221,6 +2321,10 @@ def main():
 
     logging.info(f"📄 Loaded {len(df)} articles")
 
+    log_query_type_distribution(df, "Raw articles loaded")
+    log_gate_distribution(df, "Raw articles loaded")
+    log_source_type_distribution(df, "Raw articles loaded")
+
     # Load Excel mapping data
     try:
         excel_data = load_excel_data()
@@ -2240,11 +2344,23 @@ def main():
     # Stage 1: Quick scoring
     df = stage1_quick_scoring(df)
 
+    log_query_type_distribution(df, "After Stage 1 scoring")
+    log_relevance_yield_by_query_type(df, "After Stage 1 scoring")
+
     # Stage 2: Full analysis (only high-relevance)
     df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
 
+    log_query_type_distribution(df, "After Stage 2 full analysis")
+    log_category_yield_by_query_type(df, "After Stage 2 full analysis")
+
     # Two-phase deduplication on high-relevance articles
     high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
+
+    log_query_type_distribution(high_relevance_df, "After relevance threshold filtering")
+    log_relevance_yield_by_query_type(high_relevance_df, "After relevance threshold filtering")
+    log_gate_distribution(high_relevance_df, "After relevance threshold filtering")
+    log_source_type_distribution(high_relevance_df, "After relevance threshold filtering")
+
     if len(high_relevance_df) > 0:
         non_dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == False].copy()
         dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == True].copy()
@@ -2257,6 +2373,11 @@ def main():
 
         high_relevance_df = pd.concat([non_dupes, dupes], ignore_index=True)
         high_relevance_df = high_relevance_df.drop(columns=['_fingerprint'], errors='ignore')
+
+    log_query_type_distribution(high_relevance_df, "Final articles before save")
+    log_category_yield_by_query_type(high_relevance_df, "Final articles before save")
+    log_gate_distribution(high_relevance_df, "Final articles before save")
+    log_source_type_distribution(high_relevance_df, "Final articles before save")
 
     # Save to processed_articles table (only deduplicated high-relevance)
 
