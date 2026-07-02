@@ -264,6 +264,99 @@ def log_source_type_distribution(df, label):
     except Exception as e:
         logging.warning("Could not log source_type distribution for %s: %s", label, e)
 
+# ============================================================
+# Change 5 Part A: event-clustering scaffolding (safe, no behavior change yet).
+# ============================================================
+RELATIONSHIP_EXACT_DUPLICATE = "exact_duplicate"
+RELATIONSHIP_SAME_EVENT = "same_event"
+RELATIONSHIP_FOLLOW_ON_UPDATE = "follow_on_update"
+RELATIONSHIP_COMMENTARY = "commentary_on_event"
+RELATIONSHIP_RELATED_CONTEXT = "related_context"
+RELATIONSHIP_SEPARATE_EVENT = "separate_event"
+
+RELATIONSHIP_TYPES = [
+    RELATIONSHIP_EXACT_DUPLICATE,
+    RELATIONSHIP_SAME_EVENT,
+    RELATIONSHIP_FOLLOW_ON_UPDATE,
+    RELATIONSHIP_COMMENTARY,
+    RELATIONSHIP_RELATED_CONTEXT,
+    RELATIONSHIP_SEPARATE_EVENT,
+]
+
+
+def normalize_text_for_matching(value: str) -> str:
+    """Normalize text for event matching."""
+    if value is None:
+        return ""
+    value = str(value).lower().strip()
+    value = re.sub(r"[^a-z0-9\s&.-]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def normalize_numeric_value(value):
+    """Safely normalize numeric fields such as contract value."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def values_close(v1, v2, tolerance_pct=10) -> bool:
+    """Check if two numeric values are close within tolerance percentage."""
+    n1 = normalize_numeric_value(v1)
+    n2 = normalize_numeric_value(v2)
+    if n1 is None or n2 is None:
+        return False
+    if n1 == 0 and n2 == 0:
+        return True
+    if max(abs(n1), abs(n2)) == 0:
+        return False
+    diff_pct = abs(n1 - n2) / max(abs(n1), abs(n2)) * 100
+    return diff_pct <= tolerance_pct
+
+
+def split_csv_field(value: str) -> list:
+    """Split comma-separated fields like competitors or SBUs into a cleaned list."""
+    if not value:
+        return []
+    return [
+        item.strip()
+        for item in str(value).split(",")
+        if item and item.strip() and item.strip() != "-"
+    ]
+
+
+def assign_event_clusters_scaffold(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Placeholder scaffold for Change 5 event clustering.
+
+    Current behavior:
+    - Does not change existing deduplication behavior.
+    - Ensures cluster-related columns exist.
+    - Sets cluster_id to None for now.
+    - Sets relationship_type to separate_event for now.
+    - Sets is_representative_article to True for all current final articles.
+
+    Later parts will replace this scaffold with actual event matching and cluster assignment.
+    """
+    if df is None or df.empty:
+        return df
+    if "cluster_id" not in df.columns:
+        df["cluster_id"] = None
+    if "relationship_type" not in df.columns:
+        df["relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
+    if "is_representative_article" not in df.columns:
+        df["is_representative_article"] = True
+    logging.info("Event clustering scaffold applied: %s articles marked as separate_event", len(df))
+    return df
 
 def save_to_processed_articles(df: pd.DataFrame):
     """Save processed articles to processed_articles table"""
@@ -288,6 +381,35 @@ def save_to_processed_articles(df: pd.DataFrame):
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS detected_strategic_theme TEXT;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS search_query TEXT;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS accepted_by_gate TEXT;
+    #
+    # SQL schema update required for event clustering (Change 5 Part A):
+    #   CREATE TABLE IF NOT EXISTS event_clusters (
+    #       id SERIAL PRIMARY KEY,
+    #       cluster_title TEXT,
+    #       event_type TEXT,
+    #       primary_sbu TEXT,
+    #       secondary_sbus TEXT,
+    #       competitors TEXT,
+    #       client_or_authority TEXT,
+    #       project_name TEXT,
+    #       geography TEXT,
+    #       contract_value_inr_crore NUMERIC,
+    #       representative_article_id INTEGER,
+    #       canonical_fingerprint JSONB,
+    #       cluster_summary TEXT,
+    #       why_it_matters TEXT,
+    #       recommended_action TEXT,
+    #       cluster_rank_score INTEGER DEFAULT 0,
+    #       source_confidence TEXT,
+    #       article_count INTEGER DEFAULT 1,
+    #       first_seen TIMESTAMP,
+    #       last_seen TIMESTAMP,
+    #       created_at TIMESTAMP DEFAULT NOW(),
+    #       updated_at TIMESTAMP DEFAULT NOW()
+    #   );
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_id INTEGER;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS relationship_type TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS is_representative_article BOOLEAN DEFAULT FALSE;
     # ------------------------------------------------------------------
     insert_query = """
     INSERT INTO processed_articles (
@@ -319,12 +441,16 @@ def save_to_processed_articles(df: pd.DataFrame):
         detected_client_authority,
         detected_strategic_theme,
         search_query,
-        accepted_by_gate
+        accepted_by_gate,
+        cluster_id,
+        relationship_type,
+        is_representative_article
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s,
-        %s, %s
+        %s, %s,
+        %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -374,6 +500,9 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('detected_strategic_theme', ''),
                 row.get('search_query'),
                 row.get('accepted_by_gate', ''),
+                row.get('cluster_id'),
+                row.get('relationship_type', RELATIONSHIP_SEPARATE_EVENT),
+                row.get('is_representative_article', True),
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -2378,6 +2507,9 @@ def main():
     log_category_yield_by_query_type(high_relevance_df, "Final articles before save")
     log_gate_distribution(high_relevance_df, "Final articles before save")
     log_source_type_distribution(high_relevance_df, "Final articles before save")
+
+    # Change 5 Part A: apply event-clustering scaffold (safe defaults only)
+    high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
 
     # Save to processed_articles table (only deduplicated high-relevance)
 
