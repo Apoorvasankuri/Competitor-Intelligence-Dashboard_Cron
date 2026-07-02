@@ -886,7 +886,151 @@ def create_in_memory_event_clusters(df: pd.DataFrame) -> pd.DataFrame:
         pass
 
     return df
+# ============================================================
+# Change 5 Part D: build cluster-level event fields in memory.
+# Deterministic only (no LLM). Does NOT write event_clusters table.
+# ============================================================
+def get_row_id(row):
+    """Return best available article id."""
+    if hasattr(row, "get"):
+        return row.get("id") or row.get("article_id") or row.get("raw_article_id")
+    return None
 
+
+def get_row_summary(row) -> str:
+    """Return best available summary field."""
+    if hasattr(row, "get"):
+        return (
+            row.get("summary")
+            or row.get("kec_business_summary")
+            or row.get("executive_summary")
+            or ""
+        )
+    return ""
+
+
+def get_row_link(row) -> str:
+    """Return best available article URL."""
+    if hasattr(row, "get"):
+        return row.get("link") or row.get("Link") or row.get("url") or row.get("article_url") or ""
+    return ""
+
+
+def derive_source_confidence(source_score: int) -> str:
+    """Convert source authority score to confidence label."""
+    try:
+        score = int(source_score)
+    except Exception:
+        score = 5
+    if score >= 50:
+        return "High"
+    if score >= 30:
+        return "Medium"
+    return "Low"
+
+
+def join_unique_values(values) -> str:
+    """Join unique non-empty values as a comma-separated string."""
+    cleaned = []
+    seen = set()
+    for value in values:
+        if value is None:
+            continue
+        parts = split_csv_field(value) if isinstance(value, str) else [value]
+        for part in parts:
+            part_clean = str(part).strip()
+            if not part_clean or part_clean == "-":
+                continue
+            key = normalize_text_for_matching(part_clean)
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(part_clean)
+    return ", ".join(cleaned)
+
+
+def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add cluster-level event fields to every row using deterministic data from the
+    representative article and cluster members. No LLM. No event_clusters writes.
+    """
+    if df is None or df.empty:
+        return df
+
+    if "cluster_id" not in df.columns:
+        logging.warning("build_cluster_event_fields called without cluster_id; applying scaffold")
+        df = assign_event_clusters_scaffold(df)
+
+    df = df.copy()
+
+    cluster_columns_defaults = {
+        "cluster_title": "",
+        "cluster_summary": "",
+        "cluster_article_count": 1,
+        "cluster_representative_article_id": None,
+        "cluster_source_confidence": "Low",
+        "cluster_rank_score": 0,
+        "cluster_competitors": "",
+        "cluster_sbus": "",
+        "cluster_categories": "",
+        "cluster_primary_source": "",
+        "cluster_primary_source_type": "",
+        "cluster_primary_url": "",
+    }
+    for col, default_value in cluster_columns_defaults.items():
+        if col not in df.columns:
+            df[col] = default_value
+
+    for cluster_id, cluster_df in df.groupby("cluster_id", dropna=False):
+        if cluster_df.empty:
+            continue
+
+        representative_rows = cluster_df[cluster_df.get("is_representative_article", False) == True]
+        if representative_rows.empty:
+            representative_idx = choose_representative_index(df, list(cluster_df.index))
+            df.at[representative_idx, "is_representative_article"] = True
+            representative_row = df.loc[representative_idx]
+        else:
+            representative_idx = representative_rows.index[0]
+            representative_row = df.loc[representative_idx]
+
+        cluster_title = get_row_title(representative_row)
+        cluster_summary = get_row_summary(representative_row)
+        cluster_article_count = len(cluster_df)
+        cluster_representative_article_id = get_row_id(representative_row)
+        cluster_rank_score = max(safe_rank_score(row) for _, row in cluster_df.iterrows())
+
+        source_score = safe_source_score(representative_row)
+        cluster_source_confidence = derive_source_confidence(source_score)
+
+        cluster_competitors = join_unique_values(cluster_df.get("competitor_tagging", pd.Series(dtype=str)).tolist())
+        cluster_sbus = join_unique_values(cluster_df.get("sbu_tagging", pd.Series(dtype=str)).tolist())
+        cluster_categories = join_unique_values(cluster_df.get("category_tag", pd.Series(dtype=str)).tolist())
+
+        cluster_primary_source = representative_row.get("Source") or representative_row.get("source") or ""
+        cluster_primary_source_type = representative_row.get("source_type") or ""
+        cluster_primary_url = get_row_link(representative_row)
+
+        for idx in cluster_df.index:
+            df.at[idx, "cluster_title"] = cluster_title
+            df.at[idx, "cluster_summary"] = cluster_summary
+            df.at[idx, "cluster_article_count"] = cluster_article_count
+            df.at[idx, "cluster_representative_article_id"] = cluster_representative_article_id
+            df.at[idx, "cluster_source_confidence"] = cluster_source_confidence
+            df.at[idx, "cluster_rank_score"] = cluster_rank_score
+            df.at[idx, "cluster_competitors"] = cluster_competitors
+            df.at[idx, "cluster_sbus"] = cluster_sbus
+            df.at[idx, "cluster_categories"] = cluster_categories
+            df.at[idx, "cluster_primary_source"] = cluster_primary_source
+            df.at[idx, "cluster_primary_source_type"] = cluster_primary_source_type
+            df.at[idx, "cluster_primary_url"] = cluster_primary_url
+
+    try:
+        unique_clusters = df["cluster_id"].nunique(dropna=True)
+        logging.info("Cluster event fields built for %s clusters", unique_clusters)
+    except Exception:
+        pass
+
+    return df
 def save_to_processed_articles(df: pd.DataFrame):
     """Save processed articles to processed_articles table"""
     if df.empty:
@@ -939,6 +1083,20 @@ def save_to_processed_articles(df: pd.DataFrame):
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_id INTEGER;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS relationship_type TEXT;
     #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS is_representative_article BOOLEAN DEFAULT FALSE;
+    #
+    # SQL schema update required for cluster event fields (Change 5 Part D):
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_title TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_summary TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_article_count INTEGER DEFAULT 1;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_representative_article_id INTEGER;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_source_confidence TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_rank_score INTEGER DEFAULT 0;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_competitors TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_sbus TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_categories TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_primary_source TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_primary_source_type TEXT;
+    #   ALTER TABLE processed_articles ADD COLUMN IF NOT EXISTS cluster_primary_url TEXT;
     # ------------------------------------------------------------------
     insert_query = """
     INSERT INTO processed_articles (
@@ -973,13 +1131,26 @@ def save_to_processed_articles(df: pd.DataFrame):
         accepted_by_gate,
         cluster_id,
         relationship_type,
-        is_representative_article
+        is_representative_article,
+        cluster_title,
+        cluster_summary,
+        cluster_article_count,
+        cluster_representative_article_id,
+        cluster_source_confidence,
+        cluster_rank_score,
+        cluster_competitors,
+        cluster_sbus,
+        cluster_categories,
+        cluster_primary_source,
+        cluster_primary_source_type,
+        cluster_primary_url
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s,
         %s, %s,
-        %s, %s, %s
+        %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -1032,6 +1203,18 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('cluster_id'),
                 row.get('relationship_type', RELATIONSHIP_SEPARATE_EVENT),
                 row.get('is_representative_article', True),
+                row.get('cluster_title', ''),
+                row.get('cluster_summary', ''),
+                row.get('cluster_article_count', 1),
+                row.get('cluster_representative_article_id'),
+                row.get('cluster_source_confidence', 'Low'),
+                row.get('cluster_rank_score', 0),
+                row.get('cluster_competitors', ''),
+                row.get('cluster_sbus', ''),
+                row.get('cluster_categories', ''),
+                row.get('cluster_primary_source', ''),
+                row.get('cluster_primary_source_type', ''),
+                row.get('cluster_primary_url', ''),
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -3043,6 +3226,9 @@ def main():
     except Exception as e:
         logging.warning("Event clustering failed, falling back to scaffold: %s", e)
         high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
+
+    # Change 5 Part D: build deterministic cluster-level event fields
+    high_relevance_df = build_cluster_event_fields(high_relevance_df)
 
     # Save to processed_articles table (only deduplicated high-relevance)
 
