@@ -2979,8 +2979,28 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             contents[idx] = future.result()
-    
-    logging.info(f"   ✅ Scraped {len(contents)} articles")
+
+    # Change 17: scrape success-rate observability. scrape_article() already
+    # swallows every failure (bot-block, 403, timeout, consent wall) and
+    # returns "" — previously that was invisible; Stage 2 would silently
+    # fall back to title-only analysis for those rows with no signal
+    # anywhere that it happened. An empty string is an imperfect proxy for
+    # "failed" (a real article could theoretically have no extractable
+    # text), but in practice is a reliable enough signal to size the problem.
+    scrape_empty_count = sum(1 for v in contents.values() if not (v or "").strip())
+    scrape_success_count = len(contents) - scrape_empty_count
+    scrape_success_rate = (scrape_success_count / len(contents) * 100) if contents else 0.0
+    logging.info(
+        f"   ✅ Scraped {len(contents)} articles: {scrape_success_count} with content "
+        f"({scrape_success_rate:.1f}%), {scrape_empty_count} empty/failed"
+    )
+    if scrape_empty_count > 0 and scrape_success_rate < 70:
+        logging.warning(
+            f"   ⚠️ Scrape success rate {scrape_success_rate:.1f}% is low this run — "
+            f"Stage 2 analysis (competitor/value/geography extraction) for the "
+            f"{scrape_empty_count} empty-content articles is falling back to title-only, "
+            f"which is materially less reliable."
+        )
     
     high_rel_indices = list(high_rel_df.index)
     
@@ -3005,6 +3025,7 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
         batch_indices, articles_batch = batch_tuple
         return batch_indices, batch_full_analysis(articles_batch, full_prompt)
     
+    unconfirmed_value_count = 0
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(analyze_batch, b): b for b in all_batches}
         for future in as_completed(futures):
@@ -3016,10 +3037,33 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
                 df.at[idx, 'competitor_tagging'] = official_competitors
                 df.at[idx, 'sbu_tagging'] = analysis.get('sbu_tagging', 'None')
                 df.at[idx, 'category_tag'] = analysis.get('category_tag', 'not_analyzed')
-                df.at[idx, 'scraped_content'] = (contents.get(idx, ''))[:500]
-                df.at[idx, 'contract_value_inr_crore'] = analysis.get('contract_value_inr_crore')
+                # Change 17: widened from [:500] to [:2000] to match the content
+                # window full_analysis()/batch_full_analysis() actually give the
+                # Stage 2 LLM (analysis_text = content[:2000]) — the stored value
+                # is also reused by phase2_llm_dedup's fingerprinting (see below)
+                # and by summary generation, both of which benefit from the same
+                # depth Stage 2 itself read rather than a much shorter snippet.
+                df.at[idx, 'scraped_content'] = (contents.get(idx, ''))[:2000]
+
+                # Change 17: hallucination guardrail — don't persist a contract
+                # value the source text doesn't actually support.
+                extracted_value = analysis.get('contract_value_inr_crore')
+                if extracted_value is not None and not value_confirmed_in_text(extracted_value, contents.get(idx, '')):
+                    logging.warning(
+                        "contract_value_inr_crore=%s not found in scraped content for '%s' — nulling as unconfirmed",
+                        extracted_value, str(df.loc[idx, 'News Title'])[:60]
+                    )
+                    unconfirmed_value_count += 1
+                    extracted_value = None
+                df.at[idx, 'contract_value_inr_crore'] = extracted_value
                 df.at[idx, 'geography'] = analysis.get('geography')
-    
+
+    if unconfirmed_value_count > 0:
+        logging.warning(
+            f"   ⚠️ {unconfirmed_value_count} contract_value_inr_crore figures could not be "
+            f"confirmed against source text and were nulled out this run"
+        )
+
     logging.info(f"\n📊 Calculating ranking scores...")
     for idx in high_rel_indices:
         rank_data = calculate_rank_score(df.loc[idx], competitor_tier_map)
@@ -3037,6 +3081,42 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
 # ============================================================================
 # DEDUPLICATION - PHASE 1: STRING-BASED (FAST)
 # ============================================================================
+
+# Change 17: tolerance for confirming an LLM-extracted contract value against
+# the actual scraped article text. Matches the tolerance already used
+# elsewhere for value comparison (values_close, has_similar_numbers).
+CONTRACT_VALUE_CONFIRMATION_TOLERANCE_PCT = 10
+
+
+def value_confirmed_in_text(value, text: str, tolerance_pct: int = CONTRACT_VALUE_CONFIRMATION_TOLERANCE_PCT) -> bool:
+    """
+    Change 17: guardrail against a hallucinated contract_value_inr_crore.
+
+    The Stage 2 prompt already says "null if not mentioned," but nothing
+    previously checked that the LLM actually complied — a number could be
+    invented from the headline, general background knowledge, or simply
+    misread, with no way to catch it before it reached the dashboard as an
+    executive-facing figure.
+
+    Returns True only if `value` (or something within tolerance_pct of it,
+    after extract_numbers_from_text's crore/lakh/million unit normalization)
+    literally appears among the numbers found in `text`. Empty text can
+    never confirm a value — if we have no article content, we have no way to
+    verify anything the LLM claims, regardless of how plausible it looks.
+    """
+    if value is None:
+        return True  # nothing to confirm
+    if not text or not text.strip():
+        return False
+    try:
+        candidates = extract_numbers_from_text(text)
+    except Exception:
+        return False
+    for candidate in candidates:
+        if values_close(value, candidate, tolerance_pct=tolerance_pct):
+            return True
+    return False
+
 
 def extract_numbers_from_text(text: str) -> List[float]:
     """Extract all contract values from text, handling Indian number formats"""
@@ -3440,19 +3520,37 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
 
     df_reset = df.reset_index(drop=True)
 
-    # Step 1: Scrape articles in parallel for content
-    logging.info(f"   📥 Scraping content for {len(df_reset)} articles...")
+    # Step 1: Change 17 — reuse the content Stage 2 already scraped instead of
+    # fetching every URL a second time. The old code always re-scraped live
+    # here and only fell back to the stored scraped_content when the idx key
+    # was entirely absent from the fresh results — which never happened for
+    # any row with a Link, since every submitted future gets a dict entry
+    # even on failure (""). In practice that meant: (a) every article was
+    # fetched twice, doubling network cost and bot-block/rate-limit exposure,
+    # and (b) a transient failure on this SECOND attempt silently threw away
+    # perfectly good content Stage 2 had already captured. Only articles with
+    # no stored content get a live re-scrape here.
+    logging.info(f"   📥 Reusing Stage 2 scraped content for {len(df_reset)} articles...")
 
     contents = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_idx = {
-            executor.submit(scrape_article, row['Link']): idx
-            for idx, row in df_reset.iterrows()
-            if pd.notna(row.get('Link'))
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            contents[idx] = future.result()
+    need_rescrape = []
+    for idx, row in df_reset.iterrows():
+        existing = str(row.get('scraped_content', '') or '')
+        if existing.strip():
+            contents[idx] = existing
+        elif pd.notna(row.get('Link')):
+            need_rescrape.append(idx)
+
+    if need_rescrape:
+        logging.info(f"   📥 Re-scraping {len(need_rescrape)} articles with no stored content...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_idx = {
+                executor.submit(scrape_article, df_reset.loc[idx, 'Link']): idx
+                for idx in need_rescrape
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                contents[idx] = future.result()
 
     # Step 2: Extract fingerprints via LLM
     logging.info(f"   🔑 Extracting fingerprints...")
