@@ -1,4 +1,5 @@
 import os
+import uuid
 import logging
 import time
 import json
@@ -18,8 +19,14 @@ from datetime import datetime, date, timedelta
 yesterday = date.today() - timedelta(days=1)
 from difflib import SequenceMatcher
 
+# Pipeline run ID - shared across scraper and processor if env var is set
+PIPELINE_ID = os.getenv("PIPELINE_ID", f"run-{uuid.uuid4().hex[:8]}")
+
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format=f"%(asctime)s - %(levelname)s - [{PIPELINE_ID}] - %(message)s"
+)
 
 # Load environment variables
 load_dotenv()
@@ -63,6 +70,62 @@ def get_db_connection():
         raise Exception("DATABASE_URL environment variable not set")
     
     return psycopg.connect(database_url, row_factory=dict_row)
+
+# ============================================================================
+# PIPELINE RUN TRACKING
+# ============================================================================
+# SQL schema update required (run once in PostgreSQL):
+#
+# CREATE TABLE IF NOT EXISTS pipeline_runs (
+#     id SERIAL PRIMARY KEY,
+#     pipeline_id TEXT NOT NULL,
+#     stage TEXT NOT NULL,
+#     status TEXT NOT NULL,           -- 'started' | 'success' | 'failed'
+#     articles_in INTEGER,
+#     articles_out INTEGER,
+#     error_message TEXT,
+#     started_at TIMESTAMP DEFAULT NOW(),
+#     ended_at TIMESTAMP
+# );
+#
+# CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_id ON pipeline_runs(pipeline_id);
+# CREATE INDEX IF NOT EXISTS idx_pipeline_runs_stage ON pipeline_runs(stage);
+
+def log_pipeline_run(stage, status, articles_in=None, articles_out=None, error_message=None):
+    """
+    Insert a row into pipeline_runs for observability.
+    Never raises exceptions - failure to log should not break the pipeline.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if status in ("success", "failed"):
+            cur.execute("""
+                INSERT INTO pipeline_runs
+                    (pipeline_id, stage, status, articles_in, articles_out, error_message, started_at, ended_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (PIPELINE_ID, stage, status, articles_in, articles_out, error_message))
+        else:
+            cur.execute("""
+                INSERT INTO pipeline_runs
+                    (pipeline_id, stage, status, articles_in, articles_out, error_message, started_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """, (PIPELINE_ID, stage, status, articles_in, articles_out, error_message))
+
+        conn.commit()
+        cur.close()
+
+    except Exception as e:
+        logging.warning(f"log_pipeline_run failed for stage={stage}, status={status}: {e}")
+
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def load_raw_articles() -> pd.DataFrame:
@@ -3405,7 +3468,118 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def main():
-    """Main execution pipeline"""
+    "Main execution pipeline with structured stage tracking"
+
+    # Stage: load_raw_articles
+    log_pipeline_run("load_raw_articles", "started")
+    try:
+        df = load_raw_articles()
+        articles_in = len(df) if df is not None else 0
+        log_pipeline_run("load_raw_articles", "success", articles_in=articles_in, articles_out=articles_in)
+    except Exception as e:
+        log_pipeline_run("load_raw_articles", "failed", error_message=str(e))
+        logging.exception("load_raw_articles failed")
+        raise
+
+    if df is None or df.empty:
+        logging.warning("No raw articles to process. Skipping remaining stages.")
+        return
+
+    # Stage: stage1_quick_scoring
+    log_pipeline_run("stage1_quick_scoring", "started", articles_in=len(df))
+    try:
+        df = stage1_quick_scoring(df)
+        log_pipeline_run("stage1_quick_scoring", "success", articles_in=len(df), articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("stage1_quick_scoring", "failed", error_message=str(e))
+        logging.exception("stage1_quick_scoring failed")
+        raise
+
+    if df is None or df.empty:
+        logging.warning("No articles after Stage 1. Skipping remaining stages.")
+        return
+
+    # Stage: stage2_full_analysis
+    articles_in = len(df)
+    log_pipeline_run("stage2_full_analysis", "started", articles_in=articles_in)
+    try:
+        categories = load_excel_data()[2]
+        full_prompt = build_full_analysis_prompt(categories)
+        competitor_tier_map = load_competitor_tiers()
+        df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
+        log_pipeline_run("stage2_full_analysis", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("stage2_full_analysis", "failed", error_message=str(e))
+        logging.exception("stage2_full_analysis failed")
+        raise
+
+    if df is None or df.empty:
+        logging.warning("No articles after Stage 2. Skipping remaining stages.")
+        return
+
+    # Stage: deduplicate_articles
+    articles_in = len(df)
+    log_pipeline_run("deduplicate_articles", "started", articles_in=articles_in)
+    try:
+        df = deduplicate_articles(df)
+        log_pipeline_run("deduplicate_articles", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("deduplicate_articles", "failed", error_message=str(e))
+        logging.warning(f"deduplicate_articles failed, continuing: {e}")
+
+    # Stage: in_memory_event_clustering
+    articles_in = len(df)
+    log_pipeline_run("in_memory_event_clustering", "started", articles_in=articles_in)
+    try:
+        df = create_in_memory_event_clusters(df)
+        log_pipeline_run("in_memory_event_clustering", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("in_memory_event_clustering", "failed", error_message=str(e))
+        logging.warning(f"Event clustering failed, falling back to scaffold: {e}")
+        df = assign_event_clusters_scaffold(df)
+
+    # Stage: build_cluster_event_fields
+    articles_in = len(df)
+    log_pipeline_run("build_cluster_event_fields", "started", articles_in=articles_in)
+    try:
+        df = build_cluster_event_fields(df)
+        log_pipeline_run("build_cluster_event_fields", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("build_cluster_event_fields", "failed", error_message=str(e))
+        logging.warning(f"build_cluster_event_fields failed: {e}")
+
+    # Stage: assign_event_impact_scores
+    articles_in = len(df)
+    log_pipeline_run("assign_event_impact_scores", "started", articles_in=articles_in)
+    try:
+        df = assign_event_impact_scores(df, competitor_tier_map)
+        log_pipeline_run("assign_event_impact_scores", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("assign_event_impact_scores", "failed", error_message=str(e))
+        logging.warning(f"Event impact scoring failed: {e}")
+
+    # Stage: generate_llm_summaries
+    articles_in = len(df)
+    log_pipeline_run("generate_llm_summaries", "started", articles_in=articles_in)
+    try:
+        df = generate_llm_summaries(df)
+        log_pipeline_run("generate_llm_summaries", "success", articles_in=articles_in, articles_out=len(df))
+    except Exception as e:
+        log_pipeline_run("generate_llm_summaries", "failed", error_message=str(e))
+        logging.warning(f"LLM summary generation failed: {e}")
+
+    # Stage: save_processed_articles
+    articles_in = len(df)
+    log_pipeline_run("save_processed_articles", "started", articles_in=articles_in)
+    try:
+        save_to_processed_articles(df)
+        log_pipeline_run("save_processed_articles", "success", articles_in=articles_in, articles_out=articles_in)
+    except Exception as e:
+        log_pipeline_run("save_processed_articles", "failed", error_message=str(e))
+        logging.exception("save_to_processed_articles failed")
+        raise
+
+    logging.info("Pipeline completed successfully")
 
     start_time = time.time()
 

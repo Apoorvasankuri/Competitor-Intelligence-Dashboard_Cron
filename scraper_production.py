@@ -4,6 +4,7 @@ Scrapes Google News RSS feeds for competitor keywords and filters by SBU relevan
 """
 
 import asyncio
+import uuid
 import aiohttp
 import feedparser
 import psycopg
@@ -19,10 +20,12 @@ import pandas as pd
 from typing import List, Dict, Set
 from collections import defaultdict
 
+PIPELINE_ID = os.getenv("PIPELINE_ID", f"run-{uuid.uuid4().hex[:8]}")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format=f"%(asctime)s - %(levelname)s - [{PIPELINE_ID}] - %(message)s"
 )
 
 # Configuration
@@ -1232,6 +1235,38 @@ def get_db_connection():
     
     return psycopg.connect(database_url, row_factory=dict_row)
 
+def log_pipeline_run(stage, status, articles_in=None, articles_out=None, error_message=None):
+    """Insert a row into pipeline_runs for observability. Never raises."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if status in ("success", "failed"):
+            cur.execute("""
+                INSERT INTO pipeline_runs
+                    (pipeline_id, stage, status, articles_in, articles_out, error_message, started_at, ended_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (PIPELINE_ID, stage, status, articles_in, articles_out, error_message))
+        else:
+            cur.execute("""
+                INSERT INTO pipeline_runs
+                    (pipeline_id, stage, status, articles_in, articles_out, error_message, started_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """, (PIPELINE_ID, stage, status, articles_in, articles_out, error_message))
+
+        conn.commit()
+        cur.close()
+
+    except Exception as e:
+        logging.warning(f"log_pipeline_run failed for stage={stage}, status={status}: {e}")
+
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def log_dry_run_samples(articles):
     """Print a small sample of accepted articles for dry-run review (Change 4 Part H)."""
@@ -1358,10 +1393,41 @@ def save_to_database(articles: List[Dict]):
         logging.warning(f"⚠️  Failed to save {failed_count} articles")
 
 async def main_async():
-    """Main async scraping function"""
+    "Main async scraping function with stage tracking"
     logging.info("=" * 60)
     logging.info("Starting Competitor News Scraping Job (Async)")
     logging.info("=" * 60)
+
+    log_pipeline_run("scrape_started", "started")
+
+    try:
+        competitor_keywords, sbu_keywords, competitor_to_sbu = load_keywords_from_excel()
+        articles = await scrape_news_async(competitor_keywords, sbu_keywords, competitor_to_sbu)
+
+        articles_count = len(articles) if articles else 0
+
+        if articles_count == 0:
+            logging.warning("Google News returned zero items across all queries")
+            log_pipeline_run("scrape_completed", "failed",
+                             articles_out=0, error_message="zero_items_all_queries")
+            return
+
+        log_pipeline_run("scrape_completed", "success", articles_out=articles_count)
+
+        log_pipeline_run("save_raw_articles", "started", articles_in=articles_count)
+        try:
+            save_to_database(articles)
+            log_pipeline_run("save_raw_articles", "success",
+                             articles_in=articles_count, articles_out=articles_count)
+        except Exception as e:
+            log_pipeline_run("save_raw_articles", "failed", error_message=str(e))
+            logging.exception("save_to_database failed")
+            raise
+
+    except Exception as e:
+        log_pipeline_run("scrape_completed", "failed", error_message=str(e))
+        logging.exception("Scraper main_async failed")
+        raise
     
     # Load keywords from Excel
     keywords_data = load_keywords_from_excel()
