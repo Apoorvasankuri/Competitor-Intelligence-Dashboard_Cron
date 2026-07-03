@@ -26,6 +26,7 @@ PIPELINE_ID = os.getenv("PIPELINE_ID", f"run-{uuid.uuid4().hex[:8]}")
 logging.basicConfig(
     level=logging.INFO,
     format=f"%(asctime)s - %(levelname)s - [{PIPELINE_ID}] - %(message)s"
+
 )
 
 # Configuration
