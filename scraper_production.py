@@ -1393,7 +1393,7 @@ def save_to_database(articles: List[Dict]):
         logging.warning(f"⚠️  Failed to save {failed_count} articles")
 
 async def main_async():
-    "Main async scraping function with stage tracking"
+    """Main async scraping function with stage tracking."""
     logging.info("=" * 60)
     logging.info("Starting Competitor News Scraping Job (Async)")
     logging.info("=" * 60)
@@ -1401,69 +1401,73 @@ async def main_async():
     log_pipeline_run("scrape_started", "started")
 
     try:
-        competitor_keywords, sbu_keywords, competitor_to_sbu = load_keywords_from_excel()
-        articles = await scrape_news_async(competitor_keywords, sbu_keywords, competitor_to_sbu)
+        # Load keywords from Excel
+        keywords_data = load_keywords_from_excel()
+
+        competitor_keywords = keywords_data["competitor_keywords"]
+        sbu_keywords = keywords_data["sbu_keywords"]
+        competitor_to_sbu = keywords_data["competitor_to_sbu"]
+
+        logging.info(f"Searching for {len(competitor_keywords)} competitor keywords")
+        logging.info(f"Filtering by {len(sbu_keywords)} SBU keywords")
+        logging.info(f"Lookback period: {LOOKBACK_DAYS} days")
+
+        # Scrape news
+        articles = await scrape_news_async(
+            competitor_keywords=competitor_keywords,
+            sbu_keywords=sbu_keywords,
+            competitor_to_sbu=competitor_to_sbu,
+            lookback_days=LOOKBACK_DAYS
+        )
 
         articles_count = len(articles) if articles else 0
 
         if articles_count == 0:
             logging.warning("Google News returned zero items across all queries")
-            log_pipeline_run("scrape_completed", "failed",
-                             articles_out=0, error_message="zero_items_all_queries")
+            log_pipeline_run(
+                "scrape_completed",
+                "failed",
+                articles_out=0,
+                error_message="zero_items_all_queries"
+            )
             return
 
         log_pipeline_run("scrape_completed", "success", articles_out=articles_count)
 
+        if DRY_RUN:
+            logging.info("DRY RUN MODE: skipping database save")
+            log_dry_run_samples(articles)
+            logging.info("=" * 70)
+            logging.info("DRY RUN COMPLETE")
+            logging.info("Accepted articles: %s", len(articles))
+            logging.info("Database write: skipped")
+            logging.info("=" * 70)
+            return
+
+        # Save to database
         log_pipeline_run("save_raw_articles", "started", articles_in=articles_count)
+
         try:
             save_to_database(articles)
-            log_pipeline_run("save_raw_articles", "success",
-                             articles_in=articles_count, articles_out=articles_count)
+            log_pipeline_run(
+                "save_raw_articles",
+                "success",
+                articles_in=articles_count,
+                articles_out=articles_count
+            )
         except Exception as e:
             log_pipeline_run("save_raw_articles", "failed", error_message=str(e))
             logging.exception("save_to_database failed")
             raise
 
+        logging.info("=" * 60)
+        logging.info("Scraping Job Complete")
+        logging.info("=" * 60)
+
     except Exception as e:
         log_pipeline_run("scrape_completed", "failed", error_message=str(e))
         logging.exception("Scraper main_async failed")
         raise
-    
-    # Load keywords from Excel
-    keywords_data = load_keywords_from_excel()
-    
-    competitor_keywords = keywords_data['competitor_keywords']
-    sbu_keywords = keywords_data['sbu_keywords']
-    competitor_to_sbu = keywords_data['competitor_to_sbu']
-    
-    logging.info(f"Searching for {len(competitor_keywords)} competitor keywords")
-    logging.info(f"Filtering by {len(sbu_keywords)} SBU keywords")
-    logging.info(f"Lookback period: {LOOKBACK_DAYS} days")
-    
-    # Scrape news
-    articles = await scrape_news_async(
-        competitor_keywords=competitor_keywords,
-        sbu_keywords=sbu_keywords,
-        competitor_to_sbu=competitor_to_sbu,
-        lookback_days=LOOKBACK_DAYS
-    )
-    
-    # Save to database
-    if DRY_RUN:
-        logging.info("DRY RUN MODE: skipping database save")
-        log_dry_run_samples(articles)
-        logging.info("=" * 70)
-        logging.info("DRY RUN COMPLETE")
-        logging.info("Accepted articles: %s", len(articles))
-        logging.info("Database write: skipped")
-        logging.info("=" * 70)
-    else:
-        save_to_database(articles)
-    
-    logging.info("=" * 60)
-    logging.info("Scraping Job Complete")
-    logging.info("=" * 60)
-
 
 def main():
     """Entry point for the scraper"""

@@ -3468,7 +3468,13 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def main():
-    "Main execution pipeline with structured stage tracking"
+    """Main execution pipeline with structured stage tracking."""
+
+    start_time = time.time()
+
+    logging.info("=" * 60)
+    logging.info("KEC INTERNATIONAL - COMPETITIVE INTELLIGENCE ANALYZER")
+    logging.info("=" * 60)
 
     # Stage: load_raw_articles
     log_pipeline_run("load_raw_articles", "started")
@@ -3485,11 +3491,28 @@ def main():
         logging.warning("No raw articles to process. Skipping remaining stages.")
         return
 
+    logging.info(f"Loaded {len(df)} raw articles")
+
+    log_query_type_distribution(df, "Raw articles loaded")
+    log_gate_distribution(df, "Raw articles loaded")
+    log_source_type_distribution(df, "Raw articles loaded")
+
+    # Load Excel mapping data
+    try:
+        excel_data = load_excel_data()
+        competitor_tier_map = load_competitor_tiers()
+    except Exception as e:
+        logging.error(f"Failed to load Excel data: {e}")
+        raise
+
+    full_prompt = build_full_analysis_prompt(categories=excel_data["categories"])
+
     # Stage: stage1_quick_scoring
-    log_pipeline_run("stage1_quick_scoring", "started", articles_in=len(df))
+    articles_in = len(df)
+    log_pipeline_run("stage1_quick_scoring", "started", articles_in=articles_in)
     try:
         df = stage1_quick_scoring(df)
-        log_pipeline_run("stage1_quick_scoring", "success", articles_in=len(df), articles_out=len(df))
+        log_pipeline_run("stage1_quick_scoring", "success", articles_in=articles_in, articles_out=len(df))
     except Exception as e:
         log_pipeline_run("stage1_quick_scoring", "failed", error_message=str(e))
         logging.exception("stage1_quick_scoring failed")
@@ -3499,13 +3522,13 @@ def main():
         logging.warning("No articles after Stage 1. Skipping remaining stages.")
         return
 
+    log_query_type_distribution(df, "After Stage 1 scoring")
+    log_relevance_yield_by_query_type(df, "After Stage 1 scoring")
+
     # Stage: stage2_full_analysis
     articles_in = len(df)
     log_pipeline_run("stage2_full_analysis", "started", articles_in=articles_in)
     try:
-        categories = load_excel_data()[2]
-        full_prompt = build_full_analysis_prompt(categories)
-        competitor_tier_map = load_competitor_tiers()
         df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
         log_pipeline_run("stage2_full_analysis", "success", articles_in=articles_in, articles_out=len(df))
     except Exception as e:
@@ -3517,208 +3540,106 @@ def main():
         logging.warning("No articles after Stage 2. Skipping remaining stages.")
         return
 
+    log_query_type_distribution(df, "After Stage 2 full analysis")
+    log_category_yield_by_query_type(df, "After Stage 2 full analysis")
+
+    # Filter to high relevance before dedup / clustering / summaries / save
+    df_final = df[df["relevance_score"] >= RELEVANCE_THRESHOLD].copy()
+
+    if df_final.empty:
+        logging.warning("No high-relevance articles after threshold filtering. Nothing to save.")
+        return
+
+    log_query_type_distribution(df_final, "After relevance threshold filtering")
+    log_relevance_yield_by_query_type(df_final, "After relevance threshold filtering")
+    log_gate_distribution(df_final, "After relevance threshold filtering")
+    log_source_type_distribution(df_final, "After relevance threshold filtering")
+
     # Stage: deduplicate_articles
-    articles_in = len(df)
+    articles_in = len(df_final)
     log_pipeline_run("deduplicate_articles", "started", articles_in=articles_in)
     try:
-        df = deduplicate_articles(df)
-        log_pipeline_run("deduplicate_articles", "success", articles_in=articles_in, articles_out=len(df))
+        df_final = deduplicate_articles(df_final)
+        log_pipeline_run("deduplicate_articles", "success", articles_in=articles_in, articles_out=len(df_final))
     except Exception as e:
         log_pipeline_run("deduplicate_articles", "failed", error_message=str(e))
-        logging.warning(f"deduplicate_articles failed, continuing: {e}")
+        logging.warning(f"deduplicate_articles failed, continuing without dedup: {e}")
+
+    # Stage: generate_llm_summaries
+    articles_in = len(df_final)
+    log_pipeline_run("generate_llm_summaries", "started", articles_in=articles_in)
+    try:
+        non_dupes = df_final[df_final.get("is_duplicate", False) == False].copy()
+        dupes = df_final[df_final.get("is_duplicate", False) == True].copy()
+
+        if not non_dupes.empty:
+            non_dupes = generate_llm_summaries(non_dupes)
+
+        if not dupes.empty:
+            dupes["summary"] = dupes["News Title"]
+
+        df_final = pd.concat([non_dupes, dupes], ignore_index=True)
+        df_final = df_final.drop(columns=["_fingerprint"], errors="ignore")
+
+        log_pipeline_run("generate_llm_summaries", "success", articles_in=articles_in, articles_out=len(df_final))
+    except Exception as e:
+        log_pipeline_run("generate_llm_summaries", "failed", error_message=str(e))
+        logging.warning(f"LLM summary generation failed, continuing with existing summaries: {e}")
 
     # Stage: in_memory_event_clustering
-    articles_in = len(df)
+    articles_in = len(df_final)
     log_pipeline_run("in_memory_event_clustering", "started", articles_in=articles_in)
     try:
-        df = create_in_memory_event_clusters(df)
-        log_pipeline_run("in_memory_event_clustering", "success", articles_in=articles_in, articles_out=len(df))
+        df_final = create_in_memory_event_clusters(df_final)
+        log_pipeline_run("in_memory_event_clustering", "success", articles_in=articles_in, articles_out=len(df_final))
     except Exception as e:
         log_pipeline_run("in_memory_event_clustering", "failed", error_message=str(e))
         logging.warning(f"Event clustering failed, falling back to scaffold: {e}")
-        df = assign_event_clusters_scaffold(df)
+        df_final = assign_event_clusters_scaffold(df_final)
 
     # Stage: build_cluster_event_fields
-    articles_in = len(df)
+    articles_in = len(df_final)
     log_pipeline_run("build_cluster_event_fields", "started", articles_in=articles_in)
     try:
-        df = build_cluster_event_fields(df)
-        log_pipeline_run("build_cluster_event_fields", "success", articles_in=articles_in, articles_out=len(df))
+        df_final = build_cluster_event_fields(df_final)
+        log_pipeline_run("build_cluster_event_fields", "success", articles_in=articles_in, articles_out=len(df_final))
     except Exception as e:
         log_pipeline_run("build_cluster_event_fields", "failed", error_message=str(e))
         logging.warning(f"build_cluster_event_fields failed: {e}")
 
     # Stage: assign_event_impact_scores
-    articles_in = len(df)
+    articles_in = len(df_final)
     log_pipeline_run("assign_event_impact_scores", "started", articles_in=articles_in)
     try:
-        df = assign_event_impact_scores(df, competitor_tier_map)
-        log_pipeline_run("assign_event_impact_scores", "success", articles_in=articles_in, articles_out=len(df))
+        df_final = assign_event_impact_scores(df_final, competitor_tier_map)
+        log_pipeline_run("assign_event_impact_scores", "success", articles_in=articles_in, articles_out=len(df_final))
     except Exception as e:
         log_pipeline_run("assign_event_impact_scores", "failed", error_message=str(e))
         logging.warning(f"Event impact scoring failed: {e}")
 
-    # Stage: generate_llm_summaries
-    articles_in = len(df)
-    log_pipeline_run("generate_llm_summaries", "started", articles_in=articles_in)
-    try:
-        df = generate_llm_summaries(df)
-        log_pipeline_run("generate_llm_summaries", "success", articles_in=articles_in, articles_out=len(df))
-    except Exception as e:
-        log_pipeline_run("generate_llm_summaries", "failed", error_message=str(e))
-        logging.warning(f"LLM summary generation failed: {e}")
+    log_query_type_distribution(df_final, "Final articles before save")
+    log_category_yield_by_query_type(df_final, "Final articles before save")
+    log_gate_distribution(df_final, "Final articles before save")
+    log_source_type_distribution(df_final, "Final articles before save")
 
     # Stage: save_processed_articles
-    articles_in = len(df)
+    articles_in = len(df_final)
     log_pipeline_run("save_processed_articles", "started", articles_in=articles_in)
     try:
-        save_to_processed_articles(df)
+        save_to_processed_articles(df_final)
         log_pipeline_run("save_processed_articles", "success", articles_in=articles_in, articles_out=articles_in)
     except Exception as e:
         log_pipeline_run("save_processed_articles", "failed", error_message=str(e))
         logging.exception("save_to_processed_articles failed")
         raise
 
-    logging.info("Pipeline completed successfully")
-
-    start_time = time.time()
-
-    logging.info("="*60)
-    logging.info("KEC INTERNATIONAL - COMPETITIVE INTELLIGENCE ANALYZER")
-    logging.info("="*60)
-
-    # Load raw articles from database
-    logging.info("📥 Loading articles from raw_scraped_articles table...")
-    df = load_raw_articles()
-
-    if df.empty:
-        logging.info("ℹ️  No articles to process. Exiting.")
-        return
-
-    logging.info(f"📄 Loaded {len(df)} articles")
-
-    log_query_type_distribution(df, "Raw articles loaded")
-    log_gate_distribution(df, "Raw articles loaded")
-    log_source_type_distribution(df, "Raw articles loaded")
-
-    # Load Excel mapping data
-    try:
-        excel_data = load_excel_data()
-        competitor_tier_map = load_competitor_tiers()
-        competitor_data = load_competitor_variations()
-    except Exception as e:
-        logging.error(f"❌ Failed to load Excel data: {e}")
-        return
-    
-    # Build dynamic prompt
-    logging.info("\n🔧 Building enhanced analysis prompt...")
-    full_prompt = build_full_analysis_prompt(
-        categories=excel_data['categories']
-    )
-    logging.info(f"   ✅ Prompt built with {len(excel_data['competitors'])} competitors and {len(excel_data['categories'])} categories")
-
-    # Stage 1: Quick scoring
-    df = stage1_quick_scoring(df)
-
-    log_query_type_distribution(df, "After Stage 1 scoring")
-    log_relevance_yield_by_query_type(df, "After Stage 1 scoring")
-
-    # Stage 2: Full analysis (only high-relevance)
-    df = stage2_full_analysis(df, full_prompt, competitor_tier_map)
-
-    log_query_type_distribution(df, "After Stage 2 full analysis")
-    log_category_yield_by_query_type(df, "After Stage 2 full analysis")
-
-    # Two-phase deduplication on high-relevance articles
-    high_relevance_df = df[df['relevance_score'] >= RELEVANCE_THRESHOLD].copy()
-
-    log_query_type_distribution(high_relevance_df, "After relevance threshold filtering")
-    log_relevance_yield_by_query_type(high_relevance_df, "After relevance threshold filtering")
-    log_gate_distribution(high_relevance_df, "After relevance threshold filtering")
-    log_source_type_distribution(high_relevance_df, "After relevance threshold filtering")
-
-    if len(high_relevance_df) > 0:
-        non_dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == False].copy()
-        dupes = high_relevance_df[high_relevance_df.get('is_duplicate', False) == True].copy()
-
-        if len(non_dupes) > 0:
-            non_dupes = generate_llm_summaries(non_dupes)
-
-        if len(dupes) > 0:
-            dupes['summary'] = dupes['News Title']
-
-        high_relevance_df = pd.concat([non_dupes, dupes], ignore_index=True)
-        high_relevance_df = high_relevance_df.drop(columns=['_fingerprint'], errors='ignore')
-
-    log_query_type_distribution(high_relevance_df, "Final articles before save")
-    log_category_yield_by_query_type(high_relevance_df, "Final articles before save")
-    log_gate_distribution(high_relevance_df, "Final articles before save")
-    log_source_type_distribution(high_relevance_df, "Final articles before save")
-
-    # Change 5 Part C: group final articles into in-memory event clusters
-    try:
-        high_relevance_df = create_in_memory_event_clusters(high_relevance_df)
-    except Exception as e:
-        logging.warning("Event clustering failed, falling back to scaffold: %s", e)
-        high_relevance_df = assign_event_clusters_scaffold(high_relevance_df)
-
-    # Change 5 Part D: build deterministic cluster-level event fields
-    try:
-        high_relevance_df = assign_event_impact_scores(high_relevance_df, competitor_tier_map)
-    except Exception as e:
-        logging.warning("Event impact scoring failed, falling back to article rank_score for cluster_rank_score: %s", e)
-
-    # Save to processed_articles table (only deduplicated high-relevance)
-
-    # Save to processed_articles table (only deduplicated high-relevance)
-    logging.info("\n💾 Saving to processed_articles table...")
-    save_to_processed_articles(high_relevance_df)
-
-    # Statistics
     elapsed = time.time() - start_time
-    high_relevance = df[df['relevance_score'] >= RELEVANCE_THRESHOLD]
-
-    logging.info("\n" + "="*60)
-    logging.info("📈 PROCESSING COMPLETE")
-    logging.info("="*60)
-    logging.info(f"⏱️  Time: {elapsed/60:.1f} minutes")
-    logging.info(f"📄 Total articles processed: {len(df)}")
-    logging.info(f"⭐ High relevance: {len(high_relevance)} ({len(high_relevance)/len(df)*100:.1f}%)")
-    logging.info(f"🎯 Final report (after dedup): {len(high_relevance_df)} articles")
-
-    if len(high_relevance) > 0:
-        logging.info(f"\n📊 Average Relevance Score: {high_relevance['relevance_score'].mean():.1f}")
-
-        logging.info(f"\n📁 Top Categories:")
-        for cat, count in high_relevance['category_tag'].value_counts().head(5).items():
-            logging.info(f"   {cat}: {count}")
-
-        logging.info(f"\n📁 Top SBUs:")
-        for sbu, count in high_relevance['sbu_tagging'].value_counts().head(5).items():
-            logging.info(f"   {sbu}: {count}")
-
-        logging.info(f"\n🏢 Top Competitors:")
-        for comp, count in high_relevance['competitor_tagging'].value_counts().head(5).items():
-            if comp != '-':
-                logging.info(f"   {comp}: {count}")
-
-    # Cost estimate
-    stage1_calls = len(df)
-    stage2_calls = len(high_relevance)
-    dedup_calls = len(high_relevance_df)
-    total_calls = stage1_calls + stage2_calls + dedup_calls
-    est_tokens = (stage1_calls * 200) + (stage2_calls * 7500) + (dedup_calls * 500)
-    est_cost = (est_tokens / 1_000_000) * 3.00
-
-    logging.info(f"\n💰 API Usage:")
-    logging.info(f"   Stage 1 calls: {stage1_calls}")
-    logging.info(f"   Stage 2 calls: {stage2_calls}")
-    logging.info(f"   Dedup fingerprint calls: {dedup_calls}")
-    logging.info(f"   Total calls: {total_calls}")
-    logging.info(f"   Est. tokens: ~{est_tokens:,}")
-    logging.info(f"   Est. cost: ~${est_cost:.2f}")
-    logging.info("="*60)
-
+    logging.info("=" * 60)
+    logging.info("PROCESSING COMPLETE")
+    logging.info("=" * 60)
+    logging.info(f"Time: {elapsed/60:.1f} minutes")
+    logging.info(f"Total raw articles processed: {len(df)}")
+    logging.info(f"Final saved candidate articles: {len(df_final)}")
 
 if __name__ == "__main__":
     main()
