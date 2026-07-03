@@ -870,36 +870,204 @@ def choose_representative_index(df: pd.DataFrame, indexes: list) -> int:
     return sorted(indexes, key=sort_key, reverse=True)[0]
 
 
-def create_in_memory_event_clusters(df: pd.DataFrame) -> pd.DataFrame:
+def get_next_global_cluster_id() -> int:
     """
-    Create event clusters in memory using compare_event_relationship().
-    Assigns local cluster_id (from 1), marks one representative per cluster,
-    sets relationship_type. Does NOT write to event_clusters table.
+    Change 15: cluster_id must be globally unique across pipeline runs, not a
+    per-run local counter starting at 1 each time (the previous behavior,
+    which meant Monday's cluster_id=5 and Tuesday's unrelated cluster_id=5
+    were indistinguishable to any downstream code that groups/dedupes on
+    cluster_id alone, e.g. /api/chat's source dedup key). Returns
+    MAX(cluster_id) + 1 across processed_articles so a fresh run never mints
+    ids that collide with a previous run's. Defensive: never raises, falls
+    back to 1 on a fresh table or DB error.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(cluster_id), 0) + 1 AS next_id FROM processed_articles")
+        row = cur.fetchone()
+        cur.close()
+        next_id = int(row["next_id"]) if row and row.get("next_id") is not None else 1
+        return max(next_id, 1)
+    except Exception as e:
+        logging.warning(f"get_next_global_cluster_id failed, defaulting to 1: {e}")
+        return 1
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def resolve_cross_run_cluster_continuations(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Change 15: fixes cluster fragmentation across pipeline runs.
+
+    phase2_llm_dedup() already identifies cross-run duplicates via
+    check_fingerprint_against_db() (is_duplicate=True, matched_article_id
+    set) — but that match was previously discarded after the boolean flag.
+    A follow-on article about an event from a PRIOR run therefore got its own
+    new, locally-numbered cluster_id instead of joining the original
+    cluster, and — being alone in that new cluster — was marked
+    is_representative_article=True, resurfacing on the dashboard as a fake
+    "new" event even though it had already been flagged as a duplicate.
+
+    For every row with is_duplicate=True and a resolvable matched_article_id,
+    this pulls the matched article's existing cluster_id and descriptive
+    cluster_* fields from processed_articles and applies them directly,
+    setting is_representative_article=False so the row is correctly excluded
+    from Executive Brief / SBU Storylines / Competitor Strategy / Client-
+    Authority Tracker / chat surfacing (which all filter on
+    is_representative_article = TRUE OR cluster_id IS NULL).
+
+    Rows that don't resolve (no matched_article_id, matched row has no
+    cluster_id yet, or a DB error) are left untouched and fall through to
+    normal fresh in-memory clustering — consistent with the pipeline's
+    existing guardrail of never hiding rows on missing cluster metadata.
+
+    Adds a transient `_cluster_continuation` column (dropped before save,
+    see main()) so create_in_memory_event_clusters() and
+    build_cluster_event_fields() know to skip these rows rather than
+    recomputing them from only today's partial view. Defensive: never raises.
     """
     if df is None or df.empty:
         return df
 
-    if len(df) > MAX_EVENT_CLUSTERING_ARTICLES:
-        logging.warning(
-            "Too many articles for in-memory O(n^2) clustering: %s. Falling back to scaffold.",
-            len(df)
+    df = df.copy()
+    if "_cluster_continuation" not in df.columns:
+        df["_cluster_continuation"] = False
+
+    if "matched_article_id" not in df.columns or "is_duplicate" not in df.columns:
+        return df
+
+    candidates = df[(df["is_duplicate"] == True) & (df["matched_article_id"].notna())]
+    if candidates.empty:
+        return df
+
+    conn = None
+    try:
+        matched_ids = sorted({int(v) for v in candidates["matched_article_id"].tolist() if pd.notna(v)})
+        if not matched_ids:
+            return df
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, cluster_id, cluster_title, cluster_summary, cluster_article_count,
+                   cluster_source_confidence, cluster_competitors, cluster_sbus,
+                   cluster_categories, cluster_primary_source, cluster_primary_source_type,
+                   cluster_primary_url
+            FROM processed_articles
+            WHERE id = ANY(%s) AND cluster_id IS NOT NULL
+            """,
+            (matched_ids,),
         )
-        return assign_event_clusters_scaffold(df)
+        matches = {row["id"]: row for row in cur.fetchall()}
+        cur.close()
+    except Exception as e:
+        logging.warning(f"resolve_cross_run_cluster_continuations DB lookup failed, skipping continuation resolution: {e}")
+        return df
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    resolved_count = 0
+    for idx in candidates.index:
+        try:
+            matched_id = int(df.at[idx, "matched_article_id"])
+        except Exception:
+            continue
+        match = matches.get(matched_id)
+        if not match:
+            continue  # legacy row with no cluster_id yet — falls through to fresh clustering
+
+        df.at[idx, "cluster_id"] = match["cluster_id"]
+        df.at[idx, "is_representative_article"] = False
+        df.at[idx, "relationship_type"] = RELATIONSHIP_SAME_EVENT
+        df.at[idx, "cluster_title"] = match.get("cluster_title") or ""
+        df.at[idx, "cluster_summary"] = match.get("cluster_summary") or ""
+        df.at[idx, "cluster_source_confidence"] = match.get("cluster_source_confidence") or "Low"
+        df.at[idx, "cluster_competitors"] = match.get("cluster_competitors") or ""
+        df.at[idx, "cluster_sbus"] = match.get("cluster_sbus") or ""
+        df.at[idx, "cluster_categories"] = match.get("cluster_categories") or ""
+        df.at[idx, "cluster_primary_source"] = match.get("cluster_primary_source") or ""
+        df.at[idx, "cluster_primary_source_type"] = match.get("cluster_primary_source_type") or ""
+        df.at[idx, "cluster_primary_url"] = match.get("cluster_primary_url") or ""
+        # Best-effort snapshot only — the OLD representative row's own stored
+        # cluster_article_count is NOT updated (the pipeline is insert-only),
+        # so it can undercount slightly until a future reconciliation pass.
+        old_count = match.get("cluster_article_count")
+        try:
+            old_count = int(old_count) if old_count is not None else 1
+        except Exception:
+            old_count = 1
+        df.at[idx, "cluster_article_count"] = old_count + 1
+        df.at[idx, "_cluster_continuation"] = True
+        resolved_count += 1
+
+    logging.info(
+        "Cross-run cluster continuations resolved: %s of %s cross-run duplicate candidates joined an existing cluster",
+        resolved_count, len(candidates)
+    )
+    return df
+
+
+def create_in_memory_event_clusters(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create event clusters in memory using compare_event_relationship().
+    Assigns cluster_id (globally unique — see get_next_global_cluster_id,
+    Change 15), marks one representative per cluster, sets relationship_type.
+    Does NOT write to event_clusters table.
+
+    Change 15: rows already resolved by resolve_cross_run_cluster_continuations()
+    (marked _cluster_continuation=True) are left untouched here — they already
+    carry a valid existing cluster_id and is_representative_article=False.
+    Only the remaining ("fresh") rows go through the O(n^2) in-run matching
+    below, and fresh clusters are numbered starting from
+    get_next_global_cluster_id() so they can never collide with a previous
+    run's cluster_id values.
+    """
+    if df is None or df.empty:
+        return df
 
     df = df.copy()
-    df["cluster_id"] = None
-    df["relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
-    df["is_representative_article"] = False
+    if "_cluster_continuation" not in df.columns:
+        df["_cluster_continuation"] = False
+
+    continuation_mask = df["_cluster_continuation"] == True
+    continuation_df = df[continuation_mask].copy()
+    fresh_df = df[~continuation_mask].copy()
+
+    if fresh_df.empty:
+        return continuation_df
+
+    if len(fresh_df) > MAX_EVENT_CLUSTERING_ARTICLES:
+        logging.warning(
+            "Too many articles for in-memory O(n^2) clustering: %s. Falling back to scaffold for the fresh subset.",
+            len(fresh_df)
+        )
+        fresh_df = assign_event_clusters_scaffold(fresh_df)
+        return pd.concat([continuation_df, fresh_df]).sort_index()
+
+    fresh_df["cluster_id"] = None
+    fresh_df["relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
+    fresh_df["is_representative_article"] = False
 
     clusters = []
-    cluster_id_counter = 1
+    cluster_id_counter = get_next_global_cluster_id()
 
-    for idx, row in df.iterrows():
+    for idx, row in fresh_df.iterrows():
         assigned_cluster = None
         assigned_relationship = RELATIONSHIP_SEPARATE_EVENT
 
         for cluster in clusters:
-            representative_row = df.loc[cluster["representative_idx"]]
+            representative_row = fresh_df.loc[cluster["representative_idx"]]
             relationship = compare_event_relationship(row, representative_row)
             if relationship in [
                 RELATIONSHIP_EXACT_DUPLICATE,
@@ -918,40 +1086,40 @@ def create_in_memory_event_clusters(df: pd.DataFrame) -> pd.DataFrame:
                 "representative_idx": idx,
             }
             clusters.append(assigned_cluster)
-            df.at[idx, "cluster_id"] = cluster_id_counter
-            df.at[idx, "relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
+            fresh_df.at[idx, "cluster_id"] = cluster_id_counter
+            fresh_df.at[idx, "relationship_type"] = RELATIONSHIP_SEPARATE_EVENT
             cluster_id_counter += 1
         else:
             assigned_cluster["article_indexes"].append(idx)
-            df.at[idx, "cluster_id"] = assigned_cluster["cluster_id"]
-            df.at[idx, "relationship_type"] = assigned_relationship
-            new_rep = choose_representative_index(df, assigned_cluster["article_indexes"])
+            fresh_df.at[idx, "cluster_id"] = assigned_cluster["cluster_id"]
+            fresh_df.at[idx, "relationship_type"] = assigned_relationship
+            new_rep = choose_representative_index(fresh_df, assigned_cluster["article_indexes"])
             assigned_cluster["representative_idx"] = new_rep
 
     for cluster in clusters:
         rep_idx = cluster["representative_idx"]
         if rep_idx is not None:
-            df.at[rep_idx, "is_representative_article"] = True
+            fresh_df.at[rep_idx, "is_representative_article"] = True
 
     for cluster in clusters:
         cluster_indexes = cluster["article_indexes"]
-        if not any(bool(df.at[i, "is_representative_article"]) for i in cluster_indexes):
-            df.at[cluster_indexes[0], "is_representative_article"] = True
+        if not any(bool(fresh_df.at[i, "is_representative_article"]) for i in cluster_indexes):
+            fresh_df.at[cluster_indexes[0], "is_representative_article"] = True
 
-    total_articles = len(df)
+    total_articles = len(fresh_df)
     total_clusters = len(clusters)
     duplicate_or_related = total_articles - total_clusters
     logging.info(
-        "In-memory event clustering complete: articles=%s, clusters=%s, grouped_articles=%s",
-        total_articles, total_clusters, duplicate_or_related
+        "In-memory event clustering complete: fresh_articles=%s, new_clusters=%s, grouped_articles=%s, continuation_articles=%s",
+        total_articles, total_clusters, duplicate_or_related, len(continuation_df)
     )
     try:
-        relationship_counts = df["relationship_type"].value_counts(dropna=False).to_dict()
-        logging.info("Event relationship distribution: %s", relationship_counts)
+        relationship_counts = fresh_df["relationship_type"].value_counts(dropna=False).to_dict()
+        logging.info("Event relationship distribution (fresh): %s", relationship_counts)
     except Exception:
         pass
 
-    return df
+    return pd.concat([continuation_df, fresh_df]).sort_index()
 # ============================================================
 # Change 5 Part D: build cluster-level event fields in memory.
 # Deterministic only (no LLM). Does NOT write event_clusters table.
@@ -1018,6 +1186,14 @@ def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add cluster-level event fields to every row using deterministic data from the
     representative article and cluster members. No LLM. No event_clusters writes.
+
+    Change 15: rows already resolved as cross-run continuations
+    (_cluster_continuation=True) are skipped here — their cluster_* fields and
+    is_representative_article were already set correctly by
+    resolve_cross_run_cluster_continuations() from the ORIGINAL cluster's
+    data. Recomputing them from only today's partial view (which typically
+    contains none of the other members of that historical cluster) would
+    incorrectly promote the duplicate row back to representative status.
     """
     if df is None or df.empty:
         return df
@@ -1027,6 +1203,8 @@ def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
         df = assign_event_clusters_scaffold(df)
 
     df = df.copy()
+    if "_cluster_continuation" not in df.columns:
+        df["_cluster_continuation"] = False
 
     cluster_columns_defaults = {
         "cluster_title": "",
@@ -1046,18 +1224,22 @@ def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = default_value
 
-    for cluster_id, cluster_df in df.groupby("cluster_id", dropna=False):
+    continuation_mask = df["_cluster_continuation"] == True
+    continuation_df = df[continuation_mask]
+    computable_df = df[~continuation_mask].copy()
+
+    for cluster_id, cluster_df in computable_df.groupby("cluster_id", dropna=False):
         if cluster_df.empty:
             continue
 
         representative_rows = cluster_df[cluster_df.get("is_representative_article", False) == True]
         if representative_rows.empty:
-            representative_idx = choose_representative_index(df, list(cluster_df.index))
-            df.at[representative_idx, "is_representative_article"] = True
-            representative_row = df.loc[representative_idx]
+            representative_idx = choose_representative_index(computable_df, list(cluster_df.index))
+            computable_df.at[representative_idx, "is_representative_article"] = True
+            representative_row = computable_df.loc[representative_idx]
         else:
             representative_idx = representative_rows.index[0]
-            representative_row = df.loc[representative_idx]
+            representative_row = computable_df.loc[representative_idx]
 
         cluster_title = get_row_title(representative_row)
         cluster_summary = get_row_summary(representative_row)
@@ -1077,26 +1259,128 @@ def build_cluster_event_fields(df: pd.DataFrame) -> pd.DataFrame:
         cluster_primary_url = get_row_link(representative_row)
 
         for idx in cluster_df.index:
-            df.at[idx, "cluster_title"] = cluster_title
-            df.at[idx, "cluster_summary"] = cluster_summary
-            df.at[idx, "cluster_article_count"] = cluster_article_count
-            df.at[idx, "cluster_representative_article_id"] = cluster_representative_article_id
-            df.at[idx, "cluster_source_confidence"] = cluster_source_confidence
-            df.at[idx, "cluster_rank_score"] = cluster_rank_score
-            df.at[idx, "cluster_competitors"] = cluster_competitors
-            df.at[idx, "cluster_sbus"] = cluster_sbus
-            df.at[idx, "cluster_categories"] = cluster_categories
-            df.at[idx, "cluster_primary_source"] = cluster_primary_source
-            df.at[idx, "cluster_primary_source_type"] = cluster_primary_source_type
-            df.at[idx, "cluster_primary_url"] = cluster_primary_url
+            computable_df.at[idx, "cluster_title"] = cluster_title
+            computable_df.at[idx, "cluster_summary"] = cluster_summary
+            computable_df.at[idx, "cluster_article_count"] = cluster_article_count
+            computable_df.at[idx, "cluster_representative_article_id"] = cluster_representative_article_id
+            computable_df.at[idx, "cluster_source_confidence"] = cluster_source_confidence
+            computable_df.at[idx, "cluster_rank_score"] = cluster_rank_score
+            computable_df.at[idx, "cluster_competitors"] = cluster_competitors
+            computable_df.at[idx, "cluster_sbus"] = cluster_sbus
+            computable_df.at[idx, "cluster_categories"] = cluster_categories
+            computable_df.at[idx, "cluster_primary_source"] = cluster_primary_source
+            computable_df.at[idx, "cluster_primary_source_type"] = cluster_primary_source_type
+            computable_df.at[idx, "cluster_primary_url"] = cluster_primary_url
+
+    df = pd.concat([continuation_df, computable_df]).sort_index()
 
     try:
         unique_clusters = df["cluster_id"].nunique(dropna=True)
-        logging.info("Cluster event fields built for %s clusters", unique_clusters)
+        logging.info("Cluster event fields built for %s clusters (%s continuation rows preserved as-is)",
+                      unique_clusters, len(continuation_df))
     except Exception:
         pass
 
     return df
+# ============================================================
+# Change 15: event-impact weight tables.
+#
+# These were referenced throughout Change 5G's scoring helpers but never
+# defined anywhere in this file — every get_*_weight() call raised NameError,
+# was swallowed by that function's own except-block (which referenced the
+# same undefined name), and propagated up to compute_event_impact_score()'s
+# outer try/except, which silently returned 0. Net effect: event_impact_score
+# was 0 for every article, cluster_rank_score got overwritten to 0 for every
+# cluster, and Executive Brief / SBU Storylines / Competitor Strategy /
+# Client-Authority Tracker (all filtering on eventImpactScore >= threshold)
+# rendered permanently empty. This block is the fix.
+#
+# Design: each table is scaled so a maximally strong event (top category,
+# tier-1 competitor, mega deal value, highest-authority source, well-
+# corroborated cluster, published today) sums to exactly MAX_EVENT_IMPACT_SCORE
+# alongside the multi-signal components (actionability/confidence/sbu_fit,
+# already capped at 40/20/20 in compute_event_impact_score) — 90+80+100+60+
+# 40+50+40+20+20 = 500. Tune freely; nothing else depends on these exact
+# numbers, only on the tables existing and threshold lists staying sorted
+# descending (each get_*_weight helper returns the first tier whose
+# threshold is <= the row's value, so the largest qualifying tier must come
+# first).
+# ============================================================
+MAX_EVENT_IMPACT_SCORE = 500
+
+EVENT_CATEGORY_IMPACT_WEIGHTS = {
+    "order wins": 90,
+    "mergers & acquisitions": 85,
+    "bidding activity": 70,
+    "partnerships & alliances": 60,
+    "project execution": 55,
+    "regulatory & policy": 50,
+    "financial": 45,
+    "legal & disputes": 40,
+    "leadership & management": 25,
+    "industry trends": 20,
+    "stock market": 15,
+    "not_analyzed": 0,
+    "unknown": 30,
+}
+
+# Keyed by the integer "Tier" column from the Competitor Excel sheet
+# (load_competitor_tiers). Unmapped tiers fall back to 0 via .get(tier, 0).
+COMPETITOR_TIER_WEIGHTS = {
+    1: 80,
+    2: 55,
+    3: 30,
+    4: 10,
+}
+
+# (min_value_inr_crore, weight) — sorted descending by threshold.
+DEAL_VALUE_TIER_WEIGHTS = [
+    (5000, 100),
+    (2000, 85),
+    (1000, 65),
+    (500, 45),
+    (100, 25),
+    (10, 10),
+]
+
+# (min_source_authority_score, weight) — sorted descending by threshold.
+# Matches the 5-60 scale in scraper_production.SOURCE_REGISTRY:
+# official_exchange/client_authority/govt_policy ~58-60, company_official 50,
+# specialist media 38, business media 30, press release 20, aggregator/
+# unknown 5-10.
+SOURCE_AUTHORITY_TIER_WEIGHTS = [
+    (55, 60),
+    (45, 45),
+    (35, 30),
+    (25, 18),
+    (15, 8),
+    (0, 2),
+]
+
+# (min_cluster_article_count, weight) — sorted descending by threshold.
+# Rewards corroboration: an event independently reported by more sources is
+# more likely to be real and more important.
+CLUSTER_SIZE_TIER_WEIGHTS = [
+    (5, 40),
+    (3, 25),
+    (2, 12),
+    (1, 0),
+]
+
+# (min_days_ago, weight) — sorted descending by threshold. get_freshness_weight
+# computes days_ago = today - published_date, so a LARGER threshold catches
+# only OLDER articles; keeping the largest threshold first and smallest
+# (0 = published today) last means the freshest articles fall through to the
+# highest weight.
+CLUSTER_FRESHNESS_WEIGHTS = [
+    (14, 10),
+    (7, 20),
+    (3, 35),
+    (1, 45),
+    (0, 50),
+]
+
+
 # ============================================================
 # Change 5 Part G: event-level executive impact scoring.
 # Deterministic weights only. Defensive; never raises into the pipeline.
@@ -3154,6 +3438,7 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
     # Step 2.5: Cross-batch dedup — check each fingerprint against DB history
     logging.info("\n   🗄️ Checking fingerprints against database history...")
     df_reset['is_duplicate'] = False
+    df_reset['matched_article_id'] = None  # Change 15: needed to resolve cluster continuity
     cross_batch_dupes = 0
 
     for idx, row in df_reset.iterrows():
@@ -3168,6 +3453,7 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
         result = check_fingerprint_against_db(fp, category, competitor, pub_date)
         if result['is_duplicate']:
             df_reset.at[idx, 'is_duplicate'] = True
+            df_reset.at[idx, 'matched_article_id'] = result.get('matched_article_id')
             cross_batch_dupes += 1
 
     logging.info(f"   🗄️ Cross-batch duplicates found: {cross_batch_dupes}")
@@ -3586,6 +3872,16 @@ def main():
         log_pipeline_run("generate_llm_summaries", "failed", error_message=str(e))
         logging.warning(f"LLM summary generation failed, continuing with existing summaries: {e}")
 
+    # Stage: resolve_cluster_continuations (Change 15)
+    articles_in = len(df_final)
+    log_pipeline_run("resolve_cluster_continuations", "started", articles_in=articles_in)
+    try:
+        df_final = resolve_cross_run_cluster_continuations(df_final)
+        log_pipeline_run("resolve_cluster_continuations", "success", articles_in=articles_in, articles_out=len(df_final))
+    except Exception as e:
+        log_pipeline_run("resolve_cluster_continuations", "failed", error_message=str(e))
+        logging.warning(f"resolve_cross_run_cluster_continuations failed, continuing without cross-run continuity: {e}")
+
     # Stage: in_memory_event_clustering
     articles_in = len(df_final)
     log_pipeline_run("in_memory_event_clustering", "started", articles_in=articles_in)
@@ -3626,6 +3922,9 @@ def main():
     articles_in = len(df_final)
     log_pipeline_run("save_processed_articles", "started", articles_in=articles_in)
     try:
+        # Change 15: drop transient bookkeeping columns before save (mirrors
+        # the existing _fingerprint drop above).
+        df_final = df_final.drop(columns=["_cluster_continuation", "matched_article_id"], errors="ignore")
         save_to_processed_articles(df_final)
         log_pipeline_run("save_processed_articles", "success", articles_in=articles_in, articles_out=articles_in)
     except Exception as e:
