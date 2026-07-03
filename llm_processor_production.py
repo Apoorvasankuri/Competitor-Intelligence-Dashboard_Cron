@@ -45,6 +45,9 @@ RATE_LIMIT_DELAY = 0.15
 
 # Relevance threshold
 RELEVANCE_THRESHOLD = 70
+ACTIONABILITY_MIN_FOR_EXECBRIEF = 40
+CONFIDENCE_MIN_FOR_EXECBRIEF = 50
+SBU_FIT_MIN_FOR_EXECBRIEF = 40
 
 # Change 5 Part C: safety cap for O(n^2) in-memory event clustering.
 MAX_EVENT_CLUSTERING_ARTICLES = int(os.getenv("MAX_EVENT_CLUSTERING_ARTICLES", "500"))
@@ -1134,6 +1137,9 @@ def compute_event_impact_score(row, competitor_tier_map):
     """Deterministic executive impact score for one row, capped at MAX_EVENT_IMPACT_SCORE."""
     try:
         get = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+        actionability_component = min((normalize_numeric_value(get("actionability_score")) or 0) * 0.4, 40)
+        confidence_component = min((normalize_numeric_value(get("confidence_score")) or 0) * 0.2, 20)
+        sbu_fit_component = min((normalize_numeric_value(get("sbu_fit_score")) or 0) * 0.2, 20)
         score = (
             get_event_category_weight(get("category_tag"))
             + get_max_competitor_tier_weight(competitor_tier_map, get("competitor_tagging"))
@@ -1141,6 +1147,9 @@ def compute_event_impact_score(row, competitor_tier_map):
             + get_source_authority_weight(get("source_authority_score"))
             + get_cluster_size_weight(get("cluster_article_count"))
             + get_freshness_weight(get("published_date"))
+            + actionability_component
+            + confidence_component
+            + sbu_fit_component
         )
         if score > MAX_EVENT_IMPACT_SCORE:
             score = MAX_EVENT_IMPACT_SCORE
@@ -1303,7 +1312,10 @@ def save_to_processed_articles(df: pd.DataFrame):
         cluster_primary_source,
         cluster_primary_source_type,
         cluster_primary_url,
-        event_impact_score
+        event_impact_score,
+        actionability_score,
+        confidence_score,
+        sbu_fit_score
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s,
@@ -1311,7 +1323,8 @@ def save_to_processed_articles(df: pd.DataFrame):
         %s, %s,
         %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s
+        %s,
+        %s, %s, %s
     )
     ON CONFLICT (link, published_date) DO NOTHING
 """
@@ -1377,6 +1390,9 @@ def save_to_processed_articles(df: pd.DataFrame):
                 row.get('cluster_primary_source_type', ''),
                 row.get('cluster_primary_url', ''),
                 row.get('event_impact_score', 0),
+                row.get('actionability_score', 0),
+                row.get('confidence_score', 0),
+                row.get('sbu_fit_score', 0),
             ))
             conn.commit()
             # Delete from raw after successful save
@@ -1938,8 +1954,32 @@ Each article includes context fields (Search Query, Search Query Type, Accepted 
 - Routine noise includes generic board meetings, HR / careers, CSR, stock-only, unrelated investor admin, or governance updates with no order / project / policy / capex relevance.
 - The later full-analysis stage can validate the details.
 
-You will be given a batch of articles. For each, return ONLY its relevance score (0-100).
-Return a JSON array of objects with "id" and "score" fields. No explanation."""
+MULTI-SIGNAL SCORING (Change 9): For each article, output FOUR independent scores (0-100 each):
+
+1) relevance_score — how directly the news impacts KEC's core competitive landscape and market opportunities.
+
+2) actionability_score — how much this should trigger a concrete BD, tendering, strategy, or execution action at KEC.
+   90-100: immediate action (large competitor order win, direct tender, live bid, PGCIL/NHAI/SECI/DMRC package, government approval affecting KEC pipeline).
+   60-89: follow-up expected (partnerships, capacity expansion, new market entry, sector policy, project execution in KEC geography).
+   30-59: monitor only.
+   0-29: no action expected.
+
+3) confidence_score — how trustworthy and specific the article is.
+   90-100: named competitor, named client, specific value/scope/geography, clear category, credible source description.
+   60-89: some specifics but partial or vague.
+   30-59: generic without concrete facts.
+   0-29: unreliable, promotional, or noise.
+
+4) sbu_fit_score — alignment to KEC's SBU priorities: India T&D, International T&D, Transportation, Civil, Renewables, Oil & Gas.
+   90-100: directly one of KEC's SBUs with strong sector fit.
+   60-89: adjacent or overlapping sector.
+   30-59: broadly related.
+   0-29: unrelated.
+
+When scoring all four, consider source_type, search_query_type, accepted_by_gate, detected_client_authority, and detected_strategic_theme. For site-specific official queries, do not penalize vague titles; use the query context and source_type.
+
+You will be given a batch of articles. Return ONLY a JSON array of objects, each with:
+"id", "relevance_score", "actionability_score", "confidence_score", "sbu_fit_score". No explanation."""
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
@@ -1947,8 +1987,8 @@ Return a JSON array of objects with "id" and "score" fields. No explanation."""
     retry=retry_if_exception_type(RateLimitError),
     reraise=True
 )
-def batch_relevance_score(articles_batch: List[Dict]) -> List[int]:
-    """Score a batch of articles in a single API call."""
+def batch_relevance_score(articles_batch: List[Dict]) -> List[Dict]:
+    """Score a batch of articles in a single API call (multi-signal: relevance, actionability, confidence, sbu_fit)."""
     
     articles_text = ""
     for article in articles_batch:
@@ -1968,15 +2008,15 @@ Source Authority Score: {article.get('source_authority_score', 5)}
 Needs LLM Relevance Validation: {article.get('needs_llm_relevance_validation', False)}
 """
     
-    prompt = f"""Score these {len(articles_batch)} articles for relevance (0-100 each):
+    prompt = f"""Score these {len(articles_batch)} articles (0-100 each score):
 {articles_text}
 
-Return ONLY a JSON array like: [{{"id": 1, "score": 85}}, {{"id": 2, "score": 30}}, ...]"""
+Return ONLY a JSON array like: [{{"id": 1, "relevance_score": 85, "actionability_score": 70, "confidence_score": 80, "sbu_fit_score": 75}}, ...]"""
     
     try:
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=len(articles_batch) * 25,
+            max_tokens=len(articles_batch) * 60,
             temperature=0,
             system=[
                 {
@@ -2008,17 +2048,31 @@ Return ONLY a JSON array like: [{{"id": 1, "score": 85}}, {{"id": 2, "score": 30
         else:
             raise ValueError("No JSON array found in response")
         
+        def _clamp(v, default):
+            try:
+                return max(0, min(100, int(v)))
+            except Exception:
+                return default
+
         score_map = {}
         for item in scores_list:
             article_id = item.get('id')
-            score = int(item.get('score', 0))
-            score_map[article_id] = max(0, min(100, score))
+            # Backward compat: accept legacy "score" as relevance if present.
+            rel = item.get('relevance_score', item.get('score', 0))
+            score_map[article_id] = {
+                'relevance_score': _clamp(rel, 0),
+                'actionability_score': _clamp(item.get('actionability_score', 40), 40),
+                'confidence_score': _clamp(item.get('confidence_score', 50), 50),
+                'sbu_fit_score': _clamp(item.get('sbu_fit_score', 50), 50),
+            }
         
-        return [score_map.get(article['id'], 0) for article in articles_batch]
+        default = {'relevance_score': 0, 'actionability_score': 40, 'confidence_score': 50, 'sbu_fit_score': 50}
+        return [score_map.get(article['id'], dict(default)) for article in articles_batch]
         
     except Exception as e:
         logging.warning(f"Batch scoring failed: {e}")
-        return [0] * len(articles_batch)
+        default = {'relevance_score': 0, 'actionability_score': 40, 'confidence_score': 50, 'sbu_fit_score': 50}
+        return [dict(default) for _ in articles_batch]
 
 
 @retry(
@@ -2359,6 +2413,19 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
     #    Better sources add more points; low-authority sources add only a little.
     source_authority_score = safe_source_authority_score(row.get("source_authority_score", 5))
 
+    # Change 9: multi-signal bonus (actionability / confidence / sbu_fit), capped at 60.
+    def _sig(v):
+        try:
+            return max(0, min(100, int(float(v))))
+        except Exception:
+            return 0
+    multi_signal_bonus = min(
+        0.25 * _sig(row.get("actionability_score", 0))
+        + 0.25 * _sig(row.get("confidence_score", 0))
+        + 0.25 * _sig(row.get("sbu_fit_score", 0)),
+        60
+    )
+
     # TOTAL RANK SCORE
     total_rank = (
         category_points
@@ -2367,6 +2434,7 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
         + geography_points
         + value_points
         + source_authority_score
+        + multi_signal_bonus
     )
 
     return {
@@ -2377,7 +2445,8 @@ def calculate_rank_score(row: pd.Series, competitor_tier_map: Dict[str, int]) ->
         'competitor_points': competitor_points,
         'geography_points': geography_points,
         'value_points': value_points,
-        'source_authority_points': source_authority_score
+        'source_authority_points': source_authority_score,
+        'multi_signal_bonus': multi_signal_bonus
     }
 
 # ============================================================================
@@ -2393,6 +2462,9 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
     logging.info("="*60)
     
     relevance_scores = [0] * len(df)
+    actionability_scores = [0] * len(df)
+    confidence_scores = [0] * len(df)
+    sbu_fit_scores = [0] * len(df)
     total = len(df)
     total_batches = (total + STAGE1_BATCH_SIZE - 1) // STAGE1_BATCH_SIZE
     
@@ -2433,13 +2505,27 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
         for future in as_completed(futures):
             start_idx, batch_scores = future.result()
             batch_df = df.iloc[start_idx:start_idx+STAGE1_BATCH_SIZE]
-            for j, score in enumerate(batch_scores):
-                relevance_scores[start_idx + j] = score
-                if score >= RELEVANCE_THRESHOLD:
+            for j, scores in enumerate(batch_scores):
+                if isinstance(scores, dict):
+                    rel = scores.get('relevance_score', 0)
+                    actionability_scores[start_idx + j] = scores.get('actionability_score', 40)
+                    confidence_scores[start_idx + j] = scores.get('confidence_score', 50)
+                    sbu_fit_scores[start_idx + j] = scores.get('sbu_fit_score', 50)
+                else:
+                    # Backward compatibility if a plain int slips through
+                    rel = scores
+                    actionability_scores[start_idx + j] = 40
+                    confidence_scores[start_idx + j] = 50
+                    sbu_fit_scores[start_idx + j] = 50
+                relevance_scores[start_idx + j] = rel
+                if rel >= RELEVANCE_THRESHOLD:
                     title = str(batch_df.iloc[j]['News Title'])
-                    logging.info(f"   ✅ Score {score}: {title[:60]}...")
+                    logging.info(f"   ✅ Score {rel}: {title[:60]}...")
     
     df['relevance_score'] = relevance_scores
+    df['actionability_score'] = actionability_scores
+    df['confidence_score'] = confidence_scores
+    df['sbu_fit_score'] = sbu_fit_scores
     
     high_relevance = df[df['relevance_score'] >= RELEVANCE_THRESHOLD]
     
@@ -2454,6 +2540,19 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
     if "search_query_type" in df.columns:
         logging.info("Post-Stage-1 search_query_type distribution (survivors): %s",
                      high_relevance["search_query_type"].value_counts(dropna=False).to_dict())
+
+    # Change 9: average multi-signal scores per query_type
+    try:
+        if "search_query_type" in df.columns:
+            agg = df.groupby("search_query_type")[
+                ["relevance_score", "actionability_score", "confidence_score", "sbu_fit_score"]
+            ].mean().round(1)
+            for qtype, r in agg.iterrows():
+                logging.info("Stage1 avg [%s]: relevance=%.1f actionability=%.1f confidence=%.1f sbu_fit=%.1f",
+                             qtype, r["relevance_score"], r["actionability_score"],
+                             r["confidence_score"], r["sbu_fit_score"])
+    except Exception as e:
+        logging.warning("Could not log multi-signal averages: %s", e)
 
     return df
 
