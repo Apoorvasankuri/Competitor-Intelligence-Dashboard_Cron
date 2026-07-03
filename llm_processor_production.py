@@ -56,6 +56,12 @@ ACTIONABILITY_MIN_FOR_EXECBRIEF = 40
 CONFIDENCE_MIN_FOR_EXECBRIEF = 50
 SBU_FIT_MIN_FOR_EXECBRIEF = 40
 
+# Change 16: backstop window for load_raw_articles(). processing_status is
+# now the PRIMARY filter (only 'pending' rows are ever loaded); this date
+# bound just prevents ever reprocessing something absurdly old if a status
+# update silently failed. Independent of scraper_production.SAVE_WINDOW_DAYS.
+LOAD_WINDOW_DAYS = 7
+
 # Change 5 Part C: safety cap for O(n^2) in-memory event clustering.
 MAX_EVENT_CLUSTERING_ARTICLES = int(os.getenv("MAX_EVENT_CLUSTERING_ARTICLES", "500"))
 
@@ -129,7 +135,14 @@ def log_pipeline_run(stage, status, articles_in=None, articles_out=None, error_m
 
 
 def load_raw_articles() -> pd.DataFrame:
-    """Load unprocessed articles from raw_scraped_articles table"""
+    """Load unprocessed articles from raw_scraped_articles table.
+
+    Change 16: filters on processing_status = 'pending' (not an exact
+    single-day published_date match — see LOAD_WINDOW_DAYS above), and
+    claims every returned row by flipping it to 'processed' before
+    returning, so a widened window can never cause the same row to be
+    re-scored on a later run.
+    """
     conn = get_db_connection()
     
     query = f"""
@@ -157,7 +170,8 @@ def load_raw_articles() -> pd.DataFrame:
             search_query,
             accepted_by_gate
         FROM raw_scraped_articles
-        WHERE published_date = '{yesterday}'
+        WHERE processing_status = 'pending'
+          AND published_date >= CURRENT_DATE - INTERVAL '{LOAD_WINDOW_DAYS} days'
         ORDER BY published_date DESC
         LIMIT 5000
     """
@@ -166,10 +180,31 @@ def load_raw_articles() -> pd.DataFrame:
     cur.execute(query)
     results = cur.fetchall()
     cur.close()
-    conn.close()
-    
+
     if not results:
+        conn.close()
         return pd.DataFrame()
+
+    # Change 16: claim these rows immediately. Rows that don't end up in the
+    # final high-relevance save still stay marked 'processed' — matching
+    # today's effective behavior where a low-relevance article is scored
+    # once and never revisited, just now explicit instead of an accident of
+    # the old single-day filter aging it out of range.
+    article_ids = [r['id'] for r in results if r.get('id') is not None]
+    try:
+        mark_cur = conn.cursor()
+        mark_cur.execute(
+            "UPDATE raw_scraped_articles SET processing_status = 'processed' WHERE id = ANY(%s)",
+            (article_ids,)
+        )
+        conn.commit()
+        mark_cur.close()
+        logging.info(f"Claimed {len(article_ids)} raw articles (processing_status='processed') for this run")
+    except Exception as e:
+        conn.rollback()
+        logging.warning(f"Could not mark raw articles as processed — they may be re-scored next run: {e}")
+
+    conn.close()
     
     # Convert to DataFrame
     df = pd.DataFrame(results)

@@ -31,6 +31,18 @@ logging.basicConfig(
 
 # Configuration
 LOOKBACK_DAYS = 15
+
+# Change 16: rolling save window (fix for the single-day data-loss bug).
+# The old save_to_database() filter kept only articles published on exactly
+# "yesterday" (one calendar day) — a missed, delayed, or retried cron run
+# permanently lost anything outside that one day, even though RSS queries
+# already fetch a LOOKBACK_DAYS=15 window. SAVE_WINDOW_DAYS widens the save
+# filter so a missed run gets caught by the next one. Kept narrower than the
+# full RSS lookback so we're not re-attempting inserts for 15 days of
+# history on every run — ON CONFLICT (link, published_date) DO NOTHING in
+# save_to_database() makes any repeat inserts cheap no-ops regardless.
+SAVE_WINDOW_DAYS = 4
+
 MAX_CONCURRENT_REQUESTS = 5  # Limit concurrent requests
 REQUEST_DELAY = 1  # Delay between requests in seconds
 EXCEL_FILE_PATH = 'SBU_Competitor_Mapping.xlsx'
@@ -1298,13 +1310,13 @@ def save_to_database(articles: List[Dict]):
         logging.info("No articles to save")
         return
     
-    # Filter to only keep articles between Mar 8 and Mar 9
+    # Change 16: rolling window instead of an exact single-day match (was
+    # hardcoded to "yesterday" only — see SAVE_WINDOW_DAYS above for why).
     from datetime import date, timedelta
-    yesterday = date.today()-timedelta(days=1)
-    start_date = yesterday
-    end_date = yesterday
-    articles = [a for a in articles if start_date <= a['published_date'].date() <= end_date]
-    logging.info(f"After date filter ({yesterday}): {len(articles)} articles")
+    window_start = date.today() - timedelta(days=SAVE_WINDOW_DAYS)
+    window_end = date.today()
+    articles = [a for a in articles if window_start <= a['published_date'].date() <= window_end]
+    logging.info(f"After date filter ({window_start} to {window_end}): {len(articles)} articles")
     
     if not articles:
         logging.info("No articles in date range")
@@ -1329,6 +1341,12 @@ def save_to_database(articles: List[Dict]):
     #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS detected_client_authority TEXT;
     #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS detected_strategic_theme TEXT;
     #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS accepted_by_gate TEXT;
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # SQL schema update required (Change 16 — run once before deploying):
+    #   ALTER TABLE raw_scraped_articles ADD COLUMN IF NOT EXISTS processing_status TEXT DEFAULT 'pending';
+    #   UPDATE raw_scraped_articles SET processing_status = 'pending' WHERE processing_status IS NULL;
+    #   CREATE INDEX IF NOT EXISTS idx_raw_scraped_articles_processing_status ON raw_scraped_articles(processing_status);
     # ------------------------------------------------------------------
     insert_query = """
         INSERT INTO raw_scraped_articles (
