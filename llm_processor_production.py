@@ -3540,7 +3540,25 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
             contents[idx] = existing
         elif pd.notna(row.get('Link')):
             need_rescrape.append(idx)
+if latest_date:
+                    result["latest_processed_date"] = latest_date.isoformat()
 
+                    # published_date is a DATE column (not TIMESTAMP), so
+                    # MAX(published_date) comes back as a plain datetime.date.
+                    # datetime.now() - a_date raises TypeError (exactly the
+                    # error previously surfacing in "warnings" below) — which
+                    # was silently swallowed by the except block, so
+                    # genuinely stale data was never actually reflected in
+                    # `status`. Compare as dates, since that's the only
+                    # granularity we have anyway.
+                    latest_date_only = latest_date.date() if isinstance(latest_date, datetime) else latest_date
+                    age_days = (datetime.now().date() - latest_date_only).days
+
+                    if age_days >= 1:
+                        result["status"] = "warning"
+                        result["warnings"].append(
+                            f"Latest processed article is {age_days} day(s) old"
+                        )
     if need_rescrape:
         logging.info(f"   📥 Re-scraping {len(need_rescrape)} articles with no stored content...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
