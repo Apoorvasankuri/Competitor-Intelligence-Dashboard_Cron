@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 
 # Configuration
-LOOKBACK_DAYS = 15
+LOOKBACK_DAYS = 7
 
 # Change 16: rolling save window (fix for the single-day data-loss bug).
 # The old save_to_database() filter kept only articles published on exactly
