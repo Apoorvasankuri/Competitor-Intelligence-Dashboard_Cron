@@ -902,7 +902,7 @@ def select_dry_run_queries(search_queries: List[Dict], max_queries: int) -> List
     return selected
 
 
-def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:
+def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:
     """
     Build multi-lens Google News search queries for broader recall.
 
