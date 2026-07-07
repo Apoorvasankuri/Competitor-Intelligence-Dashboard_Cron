@@ -664,7 +664,245 @@ def detect_strategic_theme(text: str, theme_keywords: List[str]) -> str:
     return ", ".join(sorted(matched)) if matched else ""
 
 
-def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:
+
+# ============================================================
+# Change 19: scraper-stage quality gate.
+#
+# Dry run (DRY_RUN=true, DRY_RUN_MAX_QUERIES=100, LOOKBACK_DAYS=7) showed the
+# "competitor" query_type branch accepted an article purely because a
+# competitor name was detected in the title — no check on whether the
+# article was actually about a business event at all. Result: 1001 accepted
+# articles dominated by stock-price/valuation/board-meeting/investor-call
+# chatter, alongside genuine signal like "Likhitha Infrastructure secures
+# Rs 510 crore pipeline contract". This block adds a deterministic,
+# no-LLM-cost gate so a competitor name alone is never sufficient.
+# ============================================================
+
+NOISE_PHRASES = [
+    "share price",
+    "stock price",
+    "live stock price",
+    "upper circuit",
+    "lower circuit",
+    "valuation",
+    "valuation attractiveness",
+    "technical shift",
+    "bearish",
+    "bullish",
+    "momentum",
+    "buyers queue",
+    "sellers absent",
+    "promoter group",
+    "promoter shares",
+    "pledged shares",
+    "encumbrance",
+    "investor call",
+    "earnings call",
+    "q4 results calendar",
+    "results calendar",
+    "board meeting",
+    "trading update",
+    "price target",
+    "brokerage",
+    "recommendation",
+    "buy call",
+    "sell call",
+    "hold call",
+    "market cap",
+    "intraday",
+    "multibagger",
+    "dividend record date",
+    "ex-dividend",
+    "bonus issue",
+    "stock split",
+    "rights issue",
+    "warrants",
+    "appointment of directors",
+    "resignation",
+    "agm",
+    "annual general meeting",
+    "analyst rating",
+    "stock alert",
+    "shareholding pattern",
+]
+
+STRONG_EVENT_PHRASES = [
+    "wins",
+    "bags",
+    "secures",
+    "receives",
+    "awarded",
+    "award",
+    "order",
+    "contract",
+    "project",
+    "tender",
+    "bid",
+    "bidding",
+    "emerges l1",
+    "l1 bidder",
+    "lowest bidder",
+    "loa",
+    "letter of award",
+    "work order",
+    "epc",
+    "transmission",
+    "substation",
+    "hvdc",
+    "765 kv",
+    "400 kv",
+    "pipeline",
+    "gas pipeline",
+    "oil pipeline",
+    "water pipeline",
+    "metro",
+    "rail",
+    "railway",
+    "station",
+    "depot",
+    "civil package",
+    "highway",
+    "expressway",
+    "road project",
+    "solar",
+    "wind",
+    "bess",
+    "renewable",
+    "green energy corridor",
+    "commissioned",
+    "commissioning",
+    "completed",
+    "launched",
+    "approved",
+    "approval",
+    "capex",
+    "investment",
+    "acquisition",
+    "divestment",
+    "stake sale",
+    "merger",
+    "joint venture",
+    "jv",
+    "partnership",
+    "consortium",
+    "new market",
+    "expansion",
+    "capacity expansion",
+]
+
+# Source-type trust tiers, matching the exact source_type strings produced by
+# classify_source() / SOURCE_REGISTRY above.
+HIGH_MEDIUM_QUALITY_SOURCE_TYPES = {
+    "official_exchange",
+    "government_policy",
+    "client_or_authority",
+    "company_official",
+    "specialist_infrastructure_media",
+    "specialist_power_and_energy_media",
+    "business_media",
+}
+
+LOWER_TRUST_SOURCE_TYPES = {
+    "low_authority_or_noise",
+    "unknown",
+    "aggregator_or_syndication",
+    "press_release_distribution",
+}
+
+
+def normalize_for_gate(text: str) -> str:
+    """Lowercase and collapse whitespace/punctuation for phrase matching.
+    Keeps alphanumerics, spaces, '%' and '.' (so "765 kv" and "400 kv"
+    survive normalization intact)."""
+    if not text:
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^\w\s%.]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def contains_any_phrase(text: str, phrases: List[str]) -> bool:
+    """True if any phrase in `phrases` appears as a substring of normalized `text`."""
+    if not text:
+        return False
+    norm = normalize_for_gate(text)
+    for phrase in phrases:
+        if phrase in norm:
+            return True
+    return False
+
+
+def has_strong_business_event_signal(title: str, source: str) -> bool:
+    """True if the title (or source line) carries language for an actual
+    business event — order win, tender, project, M&A, commissioning, etc."""
+    combined = f"{title} {source}"
+    return contains_any_phrase(combined, STRONG_EVENT_PHRASES)
+
+
+def is_high_quality_source_type(source_type: str) -> bool:
+    """True for source types classify_source() considers high/medium
+    authority (official exchange filings, government policy, client/
+    authority portals, company IR pages, specialist trade media, business
+    media)."""
+    return (source_type or "").strip() in HIGH_MEDIUM_QUALITY_SOURCE_TYPES
+
+
+def is_pure_noise_article(title: str, source: str, source_type: str) -> bool:
+    """True only when the title/source carries noise language (stock price,
+    valuation, board-meeting boilerplate, etc.) AND no strong business-event
+    phrase rescues it. "Pure" is the key word: a title with BOTH a stock
+    phrase and a real event phrase (e.g. "Ashoka Buildcon shares jump after
+    bagging Guyana highway order") is NOT pure noise and must not be dropped
+    here — has_strong_business_event_signal is checked before returning True.
+    source_type is accepted for signature parity with the other gate helpers
+    and potential future tuning, but the noise/not-noise decision itself is
+    text-based; source-type trust is applied separately via
+    is_high_quality_source_type in the calling gate logic."""
+    combined = f"{title} {source}"
+    if not contains_any_phrase(combined, NOISE_PHRASES):
+        return False
+    if has_strong_business_event_signal(title, source):
+        return False
+    return True
+
+
+def select_dry_run_queries(search_queries: List[Dict], max_queries: int) -> List[Dict]:
+    """
+    Change 19: representative dry-run sampling across query_type.
+
+    generate_search_queries() emits "competitor" queries first (see its
+    PRIORITY ORDER docstring) — a plain search_queries[:max_queries] slice
+    therefore always sampled the first N as 100% "competitor" type and zero
+    of anything else, which is exactly why a DRY_RUN_MAX_QUERIES=100 dry run
+    generated 100 competitor queries and no site_official_exchange /
+    site_tender / site_client_authority / etc. queries at all.
+
+    Round-robins one query at a time across each query_type bucket (in the
+    order each type first appears in `search_queries`) until max_queries is
+    reached or every bucket is exhausted, guaranteeing every available
+    query_type gets representation instead of being starved by ordering.
+    """
+    if max_queries is None or max_queries <= 0 or max_queries >= len(search_queries):
+        return list(search_queries)
+
+    buckets: Dict[str, List[Dict]] = {}
+    for q in search_queries:
+        buckets.setdefault(q["query_type"], []).append(q)
+
+    selected: List[Dict] = []
+    while len(selected) < max_queries and any(buckets.values()):
+        for qtype in list(buckets.keys()):
+            if len(selected) >= max_queries:
+                break
+            bucket = buckets.get(qtype)
+            if bucket:
+                selected.append(bucket.pop(0))
+
+    return selected
+
+
+def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:def generate_search_queries(competitor_keywords: List[str], sbu_keywords: List[str]) -> List[Dict]:
     """
     Build multi-lens Google News search queries for broader recall.
 
@@ -914,8 +1152,26 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
 
     if DRY_RUN:
         logging.info("DRY RUN MODE ENABLED — database writes will be skipped")
-        logging.info("Limiting search queries to first %s queries", DRY_RUN_MAX_QUERIES)
-        search_queries = search_queries[:DRY_RUN_MAX_QUERIES]
+
+        # Change 19: representative sampling across query_type instead of a
+        # naive search_queries[:DRY_RUN_MAX_QUERIES] slice. generate_search_queries()
+        # emits "competitor" queries first, so the old slice always sampled
+        # 100% competitor-type queries and none of the site-specific/
+        # authority/theme lenses — exactly what the bug report's dry run showed.
+        original_mix = {}
+        for q in search_queries:
+            original_mix[q["query_type"]] = original_mix.get(q["query_type"], 0) + 1
+        total_generated = sum(original_mix.values())
+        logging.info("Dry-run: original query mix before sampling: %s", original_mix)
+        logging.info("Dry-run: total generated queries=%s", total_generated)
+
+        search_queries = select_dry_run_queries(search_queries, DRY_RUN_MAX_QUERIES)
+
+        sampled_mix = {}
+        for q in search_queries:
+            sampled_mix[q["query_type"]] = sampled_mix.get(q["query_type"], 0) + 1
+        logging.info("Dry-run: sampled query mix (DRY_RUN_MAX_QUERIES=%s): %s", DRY_RUN_MAX_QUERIES, sampled_mix)
+        logging.info("Dry-run: total used queries=%s", len(search_queries))
 
     query_to_type = {}
     for q in search_queries:
@@ -946,6 +1202,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     dropped_site_specialist_no_signal = 0
     accepted_by_type = {}
     dropped_by_type = {}
+    dropped_by_reason = {}  # Change 19: run-level drop-reason tally
     for result in results:
         keyword = result['keyword']
         query_type = query_to_type.get(keyword, "competitor")
@@ -1014,20 +1271,66 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
             client_authority = detect_client_authority(searchable_text, CLIENT_AUTHORITY_KEYWORDS)
             strategic_theme = detect_strategic_theme(searchable_text, STRATEGIC_THEME_KEYWORDS)
 
+            # Classify source authority/reliability. Change 19 moved this up from
+            # after the gate below (it used to run only once acceptance was
+            # already decided) because the competitor-led gate now needs
+            # source_type to evaluate is_high_quality_source_type /
+            # is_pure_noise_article before it can decide accept-vs-drop.
+            source_metadata = classify_source(link, source)
+            logging.debug(
+                f"Source classified: source='{source}', domain='{source_metadata['source_domain']}', "
+                f"type='{source_metadata['source_type']}', score={source_metadata['source_authority_score']}, "
+                f"match_method='{source_metadata['source_match_method']}'"
+            )
+
+            # ---- Change 19: universal noise gate ----
+            # A title that reads as pure stock-market/admin chatter (share
+            # price, valuation, board-meeting boilerplate, promoter-share
+            # filings, etc.) with no accompanying business-event language is
+            # dropped regardless of query_type — including site-specific/
+            # official/authority queries, since even an authoritative domain
+            # can occasionally surface a syndicated stock-alert item via a
+            # broad site: search. is_pure_noise_article already exempts any
+            # title that ALSO carries a strong business-event phrase (e.g.
+            # "shares jump after bagging Guyana highway order" is kept).
+            if is_pure_noise_article(title, source, source_metadata["source_type"]):
+                dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                query_stats[query_type]["dropped"] += 1
+                dropped_by_reason["dropped_noise_title"] = dropped_by_reason.get("dropped_noise_title", 0) + 1
+                continue
+
             # ---- Query-type-aware acceptance ----
             accepted_by_gate = ""
             needs_llm_relevance_validation = False  # set True by site-specific gates (Part E)
             if query_type in ("competitor", "competitor_sbu", "competitor_client"):
-                # Competitor-led lenses: a competitor MUST be present.
+                # Competitor-led lenses: a competitor MUST be present, AND
+                # (Change 19) competitor presence alone is no longer
+                # sufficient on its own — the dry run showed this exact gap:
+                # 1001 accepted articles, 100% from "competitor" queries,
+                # dominated by stock-price/valuation/board-meeting noise that
+                # happened to mention a competitor name. Now requires a
+                # strong business-event signal OR a high/medium-quality
+                # source_type in addition to the competitor match.
                 if not competitor:
                     dropped_no_competitor_for_competitor_query += 1
                     dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
                     query_stats[query_type]["dropped"] += 1
+                    dropped_by_reason["dropped_no_competitor"] = dropped_by_reason.get("dropped_no_competitor", 0) + 1
                     continue
+
+                strong_event = has_strong_business_event_signal(title, source)
+                high_quality_source = is_high_quality_source_type(source_metadata["source_type"])
+
+                if not (strong_event or high_quality_source):
+                    dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
+                    query_stats[query_type]["dropped"] += 1
+                    dropped_by_reason["dropped_low_quality_no_event_signal"] = dropped_by_reason.get("dropped_low_quality_no_event_signal", 0) + 1
+                    continue
+
                 accepted_competitor_led_articles += 1
                 accepted_by_type[query_type] = accepted_by_type.get(query_type, 0) + 1
                 query_stats[query_type]["accepted"] += 1
-                accepted_by_gate = "competitor_detected"
+                accepted_by_gate = "accepted_competitor_event" if strong_event else "accepted_high_quality_competitor_source"
             elif query_type in SITE_OFFICIAL_QUERY_TYPES:
                 # Change 4 Part E — official/high-authority site: lenses.
                 # Recall-first: the query already targets an authoritative domain,
@@ -1072,6 +1375,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                     dropped_site_specialist_no_signal += 1
                     dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
                     query_stats[query_type]["dropped"] += 1
+                    dropped_by_reason["dropped_site_specialist_no_signal"] = dropped_by_reason.get("dropped_site_specialist_no_signal", 0) + 1
                     continue
                 if not competitor:
                     competitor = "-"
@@ -1091,6 +1395,7 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                     dropped_no_signal_for_non_competitor_query += 1
                     dropped_by_type[query_type] = dropped_by_type.get(query_type, 0) + 1
                     query_stats[query_type]["dropped"] += 1
+                    dropped_by_reason["dropped_no_signal"] = dropped_by_reason.get("dropped_no_signal", 0) + 1
                     continue
                 if not competitor:
                     competitor = "-"
@@ -1117,14 +1422,6 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
                 sbu = "General"  # Let LLM decide relevance instead of dropping
 
             seen_links.add(link)
-
-            # Classify source authority/reliability (metadata only — never filters articles)
-            source_metadata = classify_source(link, source)
-            logging.debug(
-                f"Source classified: source='{source}', domain='{source_metadata['source_domain']}', "
-                f"type='{source_metadata['source_type']}', score={source_metadata['source_authority_score']}, "
-                f"match_method='{source_metadata['source_match_method']}'"
-            )
 
             # TODO: Add search_query_type / detected_client_authority /
             #       detected_strategic_theme columns to raw_scraped_articles in a
@@ -1176,6 +1473,18 @@ async def scrape_news_async(competitor_keywords: List[str], sbu_keywords: List[s
     )
     logging.info("Accepted by query_type: %s", accepted_by_type)
     logging.info("Dropped by query_type: %s", dropped_by_type)
+
+    # Change 19: accepted-by-gate-label / dropped-by-reason summaries.
+    accepted_by_gate_counts = {}
+    for a in all_articles:
+        g = a.get("accepted_by_gate") or "unlabeled"
+        accepted_by_gate_counts[g] = accepted_by_gate_counts.get(g, 0) + 1
+    logging.info("Accepted by gate label: %s", accepted_by_gate_counts)
+    logging.info("Dropped by reason: %s", dropped_by_reason)
+
+    total_duplicate_skips = sum(s["duplicate_link_skips"] for s in query_stats.values())
+    logging.info("Total duplicate link skips: %s", total_duplicate_skips)
+    logging.info("DRY_RUN mode: %s", DRY_RUN)
     # Yield per 100 queries generated, by query_type — the key rollout signal:
     # tells you which lenses are worth their fetch budget.
     yield_per_100 = {}
@@ -1474,6 +1783,7 @@ async def main_async():
                 articles_in=articles_count,
                 articles_out=articles_count
             )
+            logging.info("Database write: completed")  # Change 19: symmetric with the DRY_RUN "skipped" log
         except Exception as e:
             log_pipeline_run("save_raw_articles", "failed", error_message=str(e))
             logging.exception("save_to_database failed")
