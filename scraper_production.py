@@ -19,6 +19,7 @@ import re
 import pandas as pd
 from typing import List, Dict, Set
 from collections import defaultdict
+from bse_filings_ingest import fetch_bse_filing_articles
 
 PIPELINE_ID = os.getenv("PIPELINE_ID", f"run-{uuid.uuid4().hex[:8]}")
 
@@ -788,6 +789,21 @@ STRONG_EVENT_PHRASES = [
     "new market",
     "expansion",
     "capacity expansion",
+    # Credit-rating actions — competitive intelligence (affects bidding capacity,
+    # consortium eligibility, capital access). Added after real BSE run showed
+    # "L&T Secures Moody's Baa1 Rating" was being filtered by the noise gate.
+    "credit rating",
+    "rating upgrade",
+    "rating downgrade",
+    "rating reaffirmed",
+    "rating affirmed",
+    "rating outlook",
+    "moody",
+    "crisil",
+    "icra",
+    "care ratings",
+    "india ratings",
+    "fitch",
 ]
 
 # Source-type trust tiers, matching the exact source_type strings produced by
@@ -1761,6 +1777,22 @@ async def main_async():
             return
 
         log_pipeline_run("scrape_completed", "success", articles_out=articles_count)
+
+        # Change 21: BSE official-filing ingestion (runs after RSS scraping).
+        # Fetches real corporate filings for BSE-listed competitors via the
+        # direct BSE API — proper headlines, PDF-extracted content, zero LLM
+        # tokens. Articles are shaped identically to RSS articles so they flow
+        # through save_to_database, then Stage 1/2, clustering, and ranking
+        # unchanged. On any error the scraper continues normally (BSE ingestion
+        # is additive, not load-bearing).
+        if not DRY_RUN:
+            try:
+                bse_articles = fetch_bse_filing_articles()
+                if bse_articles:
+                    logging.info("BSE: adding %s filing articles to save batch.", len(bse_articles))
+                    articles.extend(bse_articles)
+            except Exception as e:
+                logging.warning("BSE filing ingestion failed (non-fatal, scraper continues): %s", e)
 
         if DRY_RUN:
             logging.info("DRY RUN MODE: skipping database save")
