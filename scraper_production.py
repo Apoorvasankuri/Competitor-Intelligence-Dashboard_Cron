@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 
 # Configuration
-LOOKBACK_DAYS = 7
+LOOKBACK_DAYS = 15
 
 # Change 16: rolling save window (fix for the single-day data-loss bug).
 # The old save_to_database() filter kept only articles published on exactly
@@ -42,7 +42,7 @@ LOOKBACK_DAYS = 7
 # full RSS lookback so we're not re-attempting inserts for 15 days of
 # history on every run — ON CONFLICT (link, published_date) DO NOTHING in
 # save_to_database() makes any repeat inserts cheap no-ops regardless.
-SAVE_WINDOW_DAYS = 4
+SAVE_WINDOW_DAYS = 15
 
 MAX_CONCURRENT_REQUESTS = 5  # Limit concurrent requests
 REQUEST_DELAY = 1  # Delay between requests in seconds
