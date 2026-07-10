@@ -1814,7 +1814,7 @@ async def main_async():
                 "success",
                 articles_in=articles_count,
                 articles_out=articles_count
-            )
+            )   
             logging.info("Database write: completed")  # Change 19: symmetric with the DRY_RUN "skipped" log
         except Exception as e:
             log_pipeline_run("save_raw_articles", "failed", error_message=str(e))

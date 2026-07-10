@@ -3711,7 +3711,8 @@ Your job is to write concise 2-3 sentence executive summaries of competitor news
 Structure each summary as:
 - Sentence 1: Who did what (the core event, using the competitor's exact full name)
 - Sentence 2: Scale and context (contract value in ₹, geography, project scope/specs)
-- Sentence 3: Strategic implication for KEC (which SBU is affected, competitive threat)
+
+Report only the facts of the event. Do NOT add strategic implications, competitive-threat commentary, or any sentence about how it affects KEC, its SBUs, or its positioning. State what happened, not what it means for KEC.
 
 Rules:
 - Use the EXACT competitor name from the "Competitor" field — if "-" or empty, infer from content
