@@ -2961,7 +2961,7 @@ def stage2_full_analysis(df: pd.DataFrame, full_prompt: str, competitor_tier_map
     df['category_tag'] = 'not_analyzed'
     df['summary'] = 'Not analyzed (low relevance)'
     df['scraped_content'] = ''
-    df['rank_score'] = 0
+    df['rank_score'] = 0.0
     df['competitor_tier'] = 3
     df['contract_value_inr_crore'] = None
     df['geography'] = None
