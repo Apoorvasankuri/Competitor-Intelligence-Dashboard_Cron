@@ -73,11 +73,157 @@ USER_AGENTS = [
 # authority / strategic-theme news that may not name a competitor.
 # ============================================================
 CLIENT_AUTHORITY_KEYWORDS = [
+    # ---- Original list (kept) ----
     "Power Grid Corporation of India", "POWERGRID", "PGCIL", "NTPC", "SECI",
     "NHAI", "MoRTH", "Indian Railways", "Railway Board", "RVNL", "IRCON",
     "DMRC", "Delhi Metro", "MMRDA", "Mumbai Metro", "BMRCL", "Bangalore Metro",
     "Chennai Metro", "CMRL", "NHSRCL", "GAIL", "ONGC", "Indian Oil", "IOCL",
-    "BPCL", "HPCL", "REC", "PFC", "CEA", "CERC"
+    "BPCL", "HPCL", "REC", "PFC", "CEA", "CERC",
+
+    # ---- India - Power T&D (client list expansion) ----
+    "Power Grid Corporation of India Limited",
+    "TANTRANSCO", "Tamil Nadu Green Energy Corporation", "Tamil Nadu Transmission Corporation",
+    "KPTCL", "Karnataka Power Transmission Corporation",
+    "MSETCL", "Maharashtra State Electricity Transmission Company",
+    "RVPNL", "Rajasthan Rajya Vidyut Prasaran Nigam",
+    "GETCO", "Gujarat Energy Transmission Corporation",
+    "MPPKVVCL", "Madhya Pradesh Poorv Kshetra Vidyut Vitaran Company",
+    "WBSETCL", "West Bengal State Electricity Transmission Company",
+    "GRIDCO", "Grid Corporation of Odisha",
+    "Adani Energy Solutions", "Adani Transmission",
+    "Sterlite Power Grid Ventures", "Sterlite Grid 32", "Sterlite Power Transmission",
+    "IndiGrid", "India Grid Trust",
+    "Torrent Power",
+    "Tata Power Company", "The Tata Power Company",
+    "VISA Power",
+    "Resonia",
+    "Adani Green Energy",
+    "Greenko", "Greenko Energy Holdings",
+    "ReNew Power", "ReNew Energy Global",
+    "Solar Energy Corporation of India",
+
+    # ---- India - Railways & Metro (client list expansion) ----
+    "Ministry of Railways",
+    "Rail Vikas Nigam",
+    "Delhi Metro Rail Corporation",
+    "Mumbai Metropolitan Region Development Authority",
+    "DFCCIL", "Dedicated Freight Corridor Corporation",
+    "BMRC", "Bangalore Metro Rail Corporation",
+    "KMRL", "Kochi Metro Rail",
+    "NCRTC", "National Capital Region Transport Corporation", "Meerut RRTS",
+    "Konkan Railway Corporation",
+
+    # ---- India - Civil / Smart Infra (client list expansion) ----
+    "National Highways Authority of India",
+    "AAI", "Airports Authority of India",
+    "Hindalco Industries",
+    "Water Resources Department Madhya Pradesh",
+    "Ministry of Defence",
+    "BEL", "Bharat Electronics Limited",
+
+    # ---- SAARC ----
+    "Bhutan Power Corporation",
+    "Druk Green Power Corporation",
+    "Nepal Electricity Authority",
+    "Power Grid Company of Bangladesh",
+    "Power Development Board Bangladesh",
+    "Ceylon Electricity Board",
+    "Lanka Electricity Company",
+    "DABS", "Da Afghanistan Breshna Sherkat",
+    "STELCO", "Maldives State Electric Company",
+
+    # ---- Middle East (client list expansion) ----
+    "Saudi Electricity Company", "SEC",
+    "Saudi Aramco",
+    "Oman Electricity Transmission Company", "OETC",
+    "Abu Dhabi Distribution Company", "ADDC",
+    "TRANSCO Abu Dhabi", "Abu Dhabi Transmission and Despatch Company",
+    "Dubai Electricity and Water Authority", "DEWA",
+    "Kuwait Ministry of Electricity and Water",
+    "Qatar General Electricity and Water Corporation", "Kahramaa",
+    "Bahrain Electricity and Water Authority", "EWA",
+    "Iraq Ministry of Electricity",
+    "National Electric Power Company Jordan", "NEPCO",
+
+    # ---- Africa (client list expansion) ----
+    "Eskom", "Eskom Holdings",
+    "Ethiopia Electric Power", "EEP",
+    "Kenya Power and Lighting Company", "KPLC",
+    "Nigeria Transmission Company", "TCN",
+    "SNEL", "Société Nationale d'Électricité",
+    "SONABEL",
+    "REGIDESO",
+    "Electricité du Mali", "EDM",
+    "STEG", "Société Tunisienne d'Électricité et du Gaz",
+    "Electricidade de Moçambique",
+    "Ghana Grid Company", "GRIDCo",
+    "Libyan General Electricity Company", "GECOL",
+    "Sonelgaz",
+    "Sudan Electricity Transmission Company", "SETCO",
+    "NamPower",
+
+    # ---- East Asia Pacific (client list expansion) ----
+    "Tenaga Nasional Berhad", "TNB",
+    "Sarawak Energy Berhad",
+    "Sabah Electricity", "SESB",
+    "Electricity Generating Authority of Thailand", "EGAT",
+    "Metropolitan Electricity Authority Thailand", "MEA",
+    "Provincial Electricity Authority Thailand", "PEA",
+    "National Grid Corporation of the Philippines", "NGCP",
+    "National Electrification Administration Philippines",
+    "National Power Corporation Philippines", "NPC",
+    "PT PLN", "Perusahaan Listrik Negara",
+    "PT Perusahaan Gas Negara", "PGN",
+    "Vietnam Electricity", "EVN", "EVNNPT",
+    "SP Group", "Singapore Power",
+    "Energy Market Authority Singapore",
+    "Électricité du Cambodge", "EDC",
+    "Électricité du Laos", "EDL",
+    "ElectraNet",
+    "Transgrid",
+    "AusNet Services",
+    "Western Power Australia",
+    "Powerlink Queensland",
+    "TasNetworks",
+    "Transpower New Zealand",
+    "PNG Power",
+    "Taiwan Power Company", "Taipower",
+    "Korea Electric Power Corporation", "KEPCO",
+    "CLP Power Hong Kong",
+
+    # ---- CIS / Central Asia ----
+    "KEGOC", "Kazakhstan Electricity Grid Operating Company",
+    "Tajiktransenergy", "Barki Tojik",
+    "Georgian State Electrosystem",
+    "Uzbekistan National Grid", "UzTransEnergo",
+    "Moldelectrica",
+    "Kazakhstan Temir Zholy",
+    "National Dispatch Centre Azerbaijan",
+    "Armenian Energy Networks",
+
+    # ---- Americas ----
+    "American Electric Power", "AEP",
+    "Duke Energy",
+    "NextEra Energy", "FPL",
+    "Pacific Gas and Electric", "PG&E",
+    "Comisión Federal de Electricidad", "CFE",
+    "Eletrobras", "CHESF",
+    "CTEEP", "Companhia de Transmissão de Energia Elétrica Paulista",
+    "Hydro-Québec",
+    "Interconexión Eléctrica", "ISA Colombia",
+
+    # ---- Europe ----
+    "Red Eléctrica de España", "REE",
+    "Réseau de Transport d'Électricité", "RTE",
+
+    # ---- Financing / Strategic Partners ----
+    "State Bank of India", "SBI",
+    "HDFC Bank",
+    "Axis Bank",
+    "Export-Import Bank of India", "EXIM Bank",
+    "African Development Bank", "AfDB",
+    "World Bank", "International Finance Corporation", "IFC",
+    "Asian Development Bank", "ADB",
 ]
 
 STRATEGIC_THEME_KEYWORDS = [

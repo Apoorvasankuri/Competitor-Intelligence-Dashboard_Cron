@@ -1368,6 +1368,253 @@ COMPETITOR_TIER_WEIGHTS = {
     4: 10,
 }
 
+# Client/Authority tiering (user-provided prioritization). Keys are
+# lowercased keyword variants matching scraper_production.CLIENT_AUTHORITY_KEYWORDS
+# entries — detected_client_authority stores whichever variant text matched,
+# so lookups here normalize to lowercase before matching. This is a bonus
+# on top of the existing 500-point cap (compute_event_impact_score already
+# clamps the total), not a rebalance of the other weight tables.
+CLIENT_AUTHORITY_TIER_MAP = {
+    "power grid corporation of india": 1,
+    "powergrid": 1,
+    "pgcil": 1,
+    "adani energy solutions": 1,
+    "adani transmission": 1,
+    "ntpc": 1,
+    "solar energy corporation of india": 1,
+    "seci": 1,
+    "adani green energy": 1,
+    "renew power": 1,
+    "renew energy global": 1,
+    "greenko": 1,
+    "greenko energy holdings": 1,
+    "rail vikas nigam": 1,
+    "rvnl": 1,
+    "dfccil": 1,
+    "dedicated freight corridor corporation": 1,
+    "dmrc": 1,
+    "delhi metro rail corporation": 1,
+    "delhi metro": 1,
+    "saudi electricity company": 1,
+    "sec": 1,
+    "dubai electricity and water authority": 1,
+    "dewa": 1,
+    "oman electricity transmission company": 1,
+    "oetc": 1,
+    "tenaga nasional berhad": 1,
+    "tnb": 1,
+    "pt pln": 1,
+    "perusahaan listrik negara": 1,
+    "korea electric power corporation": 1,
+    "kepco": 1,
+    "getco": 2,
+    "gujarat energy transmission corporation": 2,
+    "msetcl": 2,
+    "maharashtra state electricity transmission company": 2,
+    "kptcl": 2,
+    "karnataka power transmission corporation": 2,
+    "rvpnl": 2,
+    "rajasthan rajya vidyut prasaran nigam": 2,
+    "wbsetcl": 2,
+    "west bengal state electricity transmission company": 2,
+    "tantransco": 2,
+    "tamil nadu green energy corporation": 2,
+    "tamil nadu transmission corporation": 2,
+    "indigrid": 2,
+    "india grid trust": 2,
+    "torrent power": 2,
+    "tata power company": 2,
+    "the tata power company": 2,
+    "eskom": 2,
+    "eskom holdings": 2,
+    "vietnam electricity": 2,
+    "evn": 2,
+    "evnnpt": 2,
+    "national grid corporation of the philippines": 2,
+    "ngcp": 2,
+    "hydro-québec": 2,
+    "interconexión eléctrica": 2,
+    "isa colombia": 2,
+    "nhai": 3,
+    "morth": 3,
+    "indian railways": 3,
+    "railway board": 3,
+    "ircon": 3,
+    "mmrda": 3,
+    "mumbai metro": 3,
+    "bmrcl": 3,
+    "bangalore metro": 3,
+    "chennai metro": 3,
+    "cmrl": 3,
+    "nhsrcl": 3,
+    "gail": 3,
+    "ongc": 3,
+    "indian oil": 3,
+    "iocl": 3,
+    "bpcl": 3,
+    "hpcl": 3,
+    "rec": 3,
+    "pfc": 3,
+    "cea": 3,
+    "cerc": 3,
+    "power grid corporation of india limited": 3,
+    "mppkvvcl": 3,
+    "madhya pradesh poorv kshetra vidyut vitaran company": 3,
+    "gridco": 3,
+    "grid corporation of odisha": 3,
+    "sterlite power grid ventures": 3,
+    "sterlite grid 32": 3,
+    "sterlite power transmission": 3,
+    "visa power": 3,
+    "resonia": 3,
+    "ministry of railways": 3,
+    "mumbai metropolitan region development authority": 3,
+    "bmrc": 3,
+    "bangalore metro rail corporation": 3,
+    "kmrl": 3,
+    "kochi metro rail": 3,
+    "ncrtc": 3,
+    "national capital region transport corporation": 3,
+    "meerut rrts": 3,
+    "konkan railway corporation": 3,
+    "national highways authority of india": 3,
+    "aai": 3,
+    "airports authority of india": 3,
+    "hindalco industries": 3,
+    "water resources department madhya pradesh": 3,
+    "ministry of defence": 3,
+    "bel": 3,
+    "bharat electronics limited": 3,
+    "bhutan power corporation": 3,
+    "druk green power corporation": 3,
+    "nepal electricity authority": 3,
+    "power grid company of bangladesh": 3,
+    "power development board bangladesh": 3,
+    "ceylon electricity board": 3,
+    "lanka electricity company": 3,
+    "dabs": 3,
+    "da afghanistan breshna sherkat": 3,
+    "stelco": 3,
+    "maldives state electric company": 3,
+    "saudi aramco": 3,
+    "abu dhabi distribution company": 3,
+    "addc": 3,
+    "transco abu dhabi": 3,
+    "abu dhabi transmission and despatch company": 3,
+    "kuwait ministry of electricity and water": 3,
+    "qatar general electricity and water corporation": 3,
+    "kahramaa": 3,
+    "bahrain electricity and water authority": 3,
+    "ewa": 3,
+    "iraq ministry of electricity": 3,
+    "national electric power company jordan": 3,
+    "nepco": 3,
+    "ethiopia electric power": 3,
+    "eep": 3,
+    "kenya power and lighting company": 3,
+    "kplc": 3,
+    "nigeria transmission company": 3,
+    "tcn": 3,
+    "snel": 3,
+    "société nationale d'électricité": 3,
+    "sonabel": 3,
+    "regideso": 3,
+    "electricité du mali": 3,
+    "edm": 3,
+    "steg": 3,
+    "société tunisienne d'électricité et du gaz": 3,
+    "electricidade de moçambique": 3,
+    "ghana grid company": 3,
+    "libyan general electricity company": 3,
+    "gecol": 3,
+    "sonelgaz": 3,
+    "sudan electricity transmission company": 3,
+    "setco": 3,
+    "nampower": 3,
+    "sarawak energy berhad": 3,
+    "sabah electricity": 3,
+    "sesb": 3,
+    "electricity generating authority of thailand": 3,
+    "egat": 3,
+    "metropolitan electricity authority thailand": 3,
+    "mea": 3,
+    "provincial electricity authority thailand": 3,
+    "pea": 3,
+    "national electrification administration philippines": 3,
+    "national power corporation philippines": 3,
+    "npc": 3,
+    "pt perusahaan gas negara": 3,
+    "pgn": 3,
+    "sp group": 3,
+    "singapore power": 3,
+    "energy market authority singapore": 3,
+    "électricité du cambodge": 3,
+    "edc": 3,
+    "électricité du laos": 3,
+    "edl": 3,
+    "electranet": 3,
+    "transgrid": 3,
+    "ausnet services": 3,
+    "western power australia": 3,
+    "powerlink queensland": 3,
+    "tasnetworks": 3,
+    "transpower new zealand": 3,
+    "png power": 3,
+    "taiwan power company": 3,
+    "taipower": 3,
+    "clp power hong kong": 3,
+    "kegoc": 3,
+    "kazakhstan electricity grid operating company": 3,
+    "tajiktransenergy": 3,
+    "barki tojik": 3,
+    "georgian state electrosystem": 3,
+    "uzbekistan national grid": 3,
+    "uztransenergo": 3,
+    "moldelectrica": 3,
+    "kazakhstan temir zholy": 3,
+    "national dispatch centre azerbaijan": 3,
+    "armenian energy networks": 3,
+    "american electric power": 3,
+    "aep": 3,
+    "duke energy": 3,
+    "nextera energy": 3,
+    "fpl": 3,
+    "pacific gas and electric": 3,
+    "pg&e": 3,
+    "comisión federal de electricidad": 3,
+    "cfe": 3,
+    "eletrobras": 3,
+    "chesf": 3,
+    "cteep": 3,
+    "companhia de transmissão de energia elétrica paulista": 3,
+    "red eléctrica de españa": 3,
+    "ree": 3,
+    "réseau de transport d'électricité": 3,
+    "rte": 3,
+    "state bank of india": 3,
+    "sbi": 3,
+    "hdfc bank": 3,
+    "axis bank": 3,
+    "export-import bank of india": 3,
+    "exim bank": 3,
+    "african development bank": 3,
+    "afdb": 3,
+    "world bank": 3,
+    "international finance corporation": 3,
+    "ifc": 3,
+    "asian development bank": 3,
+    "adb": 3,
+}
+
+# Modest bonus scale — kept lower than COMPETITOR_TIER_WEIGHTS since this is
+# an additive signal, not the primary driver, and the total score is capped
+# at MAX_EVENT_IMPACT_SCORE regardless.
+CLIENT_AUTHORITY_TIER_WEIGHTS = {
+    1: 40,
+    2: 25,
+    3: 10,
+}
+
 # (min_value_inr_crore, weight) — sorted descending by threshold.
 DEAL_VALUE_TIER_WEIGHTS = [
     (5000, 100),
@@ -1451,6 +1698,26 @@ def get_max_competitor_tier_weight(competitor_tier_map, competitor_tagging):
         return 0
 
 
+def get_max_client_authority_tier_weight(detected_client_authority):
+    """Max client/authority tier weight across a (possibly comma-separated)
+    detected_client_authority field. Matches are case-insensitive against
+    CLIENT_AUTHORITY_TIER_MAP; unmatched or empty values contribute 0."""
+    try:
+        if not detected_client_authority:
+            return 0
+        best = 0
+        for name in split_csv_field(detected_client_authority):
+            tier = CLIENT_AUTHORITY_TIER_MAP.get(name.strip().lower())
+            if tier is None:
+                continue
+            weight = CLIENT_AUTHORITY_TIER_WEIGHTS.get(tier, 0)
+            if weight > best:
+                best = weight
+        return best
+    except Exception:
+        return 0
+
+
 def get_deal_value_weight(value_inr_crore):
     """First tier whose threshold <= value."""
     try:
@@ -1525,6 +1792,7 @@ def compute_event_impact_score(row, competitor_tier_map):
         score = (
             get_event_category_weight(get("category_tag"))
             + get_max_competitor_tier_weight(competitor_tier_map, get("competitor_tagging"))
+            + get_max_client_authority_tier_weight(get("detected_client_authority"))
             + get_deal_value_weight(get("contract_value_inr_crore"))
             + get_source_authority_weight(get("source_authority_score"))
             + get_cluster_size_weight(get("cluster_article_count"))
@@ -2023,6 +2291,22 @@ Always return the FULL OFFICIAL NAME exactly as listed below:
 
 - AFCONS Infrastructure Limited
 - Ace Pipeline Contracts Private Limited
+- ACME Solar Holdings Limited
+- Adani Green Energy Limited
+- Aditya Birla Renewables Limited
+- ArcelorMittal Nippon Steel India
+- Avaada Energy Private Limited
+- BluPine Energy Private Limited
+- Fluence Energy India Private Limited
+- Greenko Group
+- Inox Wind Limited
+- JSW Energy Limited
+- Reliance New Energy Limited
+- SAEL Industries Limited
+- Shivalaya Construction Co. Private Limited
+- Suzlon Energy Limited
+- Vikran Engineering Limited
+- Waaree Energies Limited
 - Advance Infrastructures Pvt Ltd
 - Ahluwalia Contracts (India) Limited
 - Al Fanar Group
