@@ -3636,24 +3636,31 @@ Rules:
         logging.warning(f"Fingerprint extraction failed for '{title[:50]}': {e}")
         return {}
 
-def check_fingerprint_against_db(fingerprint: Dict, category: str, competitor: str, published_date, lookback_days: int = 7) -> Dict:
+def check_fingerprint_against_db(fingerprint: Dict, category: str, competitor: str, published_date, title: str = "", lookback_days: int = 7) -> Dict:
     """
     Check if a fingerprint matches any existing article in the database.
+
+    Two independent signals are checked, either of which is sufficient:
+      1. Structured fingerprint field match (fingerprints_match) — precise but
+         brittle when the LLM extracted sparse/inconsistent fields.
+      2. Raw title similarity (SequenceMatcher > 0.85) — same threshold
+         phase1_string_dedup already uses for same-run duplicates. Catches
+         near-identical headlines (e.g. "bagged" vs "has secured") even when
+         structured fingerprint matching misses them.
+
     Returns {"is_duplicate": True/False, "matched_article_id": id or None}
     """
-    if not fingerprint:
+    if not fingerprint and not title:
         return {"is_duplicate": False, "matched_article_id": None}
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Get recent articles with fingerprints in the same category/competitor group
         cur.execute("""
             SELECT id, news_title, fingerprint, category_tag, competitor_tagging, published_date
             FROM processed_articles
-            WHERE fingerprint IS NOT NULL
-            AND category_tag = %s
+            WHERE category_tag = %s
             AND published_date >= %s - INTERVAL '%s days'
             AND is_duplicate = FALSE
             ORDER BY published_date DESC
@@ -3664,20 +3671,29 @@ def check_fingerprint_against_db(fingerprint: Dict, category: str, competitor: s
         cur.close()
         conn.close()
 
+        title_norm = str(title).lower().strip()
+
         for row in existing:
+            # Signal 2: title similarity (checked first — cheap, no JSON parsing)
+            if title_norm and row.get('news_title'):
+                existing_title_norm = str(row['news_title']).lower().strip()
+                if SequenceMatcher(None, title_norm, existing_title_norm).ratio() > 0.85:
+                    logging.info(f"   🔄 Cross-batch duplicate found (title match)! Matches article #{row['id']}: {row['news_title'][:60]}...")
+                    return {"is_duplicate": True, "matched_article_id": row['id']}
+
+            # Signal 1: structured fingerprint match
             existing_fp = row.get('fingerprint')
             if not existing_fp:
                 continue
 
-            # Parse if stored as string
             if isinstance(existing_fp, str):
                 try:
                     existing_fp = json.loads(existing_fp)
                 except:
                     continue
 
-            if fingerprints_match(fingerprint, existing_fp, category):
-                logging.info(f"   🔄 Cross-batch duplicate found! Matches article #{row['id']}: {row['news_title'][:60]}...")
+            if fingerprint and fingerprints_match(fingerprint, existing_fp, category):
+                logging.info(f"   🔄 Cross-batch duplicate found (fingerprint match)! Matches article #{row['id']}: {row['news_title'][:60]}...")
                 return {"is_duplicate": True, "matched_article_id": row['id']}
 
         return {"is_duplicate": False, "matched_article_id": None}
@@ -3860,14 +3876,15 @@ def phase2_llm_dedup(df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in df_reset.iterrows():
         fp = fingerprints.get(idx, {})
-        if not fp:
+        title = str(row.get('News Title', ''))
+        if not fp and not title:
             continue
 
         category = str(row.get('category_tag', '')).lower()
         competitor = str(row.get('competitor_tagging', '-'))
         pub_date = row.get('Published Date')
 
-        result = check_fingerprint_against_db(fp, category, competitor, pub_date)
+        result = check_fingerprint_against_db(fp, category, competitor, pub_date, title=title)
         if result['is_duplicate']:
             df_reset.at[idx, 'is_duplicate'] = True
             df_reset.at[idx, 'matched_article_id'] = result.get('matched_article_id')
@@ -4006,7 +4023,18 @@ Rules:
 - Keep it under 60 words total
 - Write in third person, present tense
 - No filler phrases like "it is worth noting" or "this highlights"
+
+INSUFFICIENT INFORMATION:
+If — after checking both the pre-extracted facts and the raw content — the article does not name a
+specific company/authority AND a specific action or event (e.g. it's a bare tender-portal header,
+a broken scrape, a generic listing page, or boilerplate with no reportable news), do NOT write a
+sentence explaining that information is insufficient. That explanatory sentence is itself useless
+filler and should never appear in output. Instead, return the exact literal string
+"SKIP_INSUFFICIENT_INFO" as that article's array entry. The caller will drop the article rather
+than display anything for it.
+
 - Return ONLY a JSON array of strings, no explanation, no markdown"""
+
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
@@ -4055,7 +4083,9 @@ Return a JSON array of strings, one summary per article, in the same order:
 Remember:
 - Use the exact competitor name from the "Competitor" field
 - Anchor on the pre-extracted facts first
-- Under 60 words per summary"""
+- Under 60 words per summary
+- If an article has no identifiable company/authority + no identifiable action or event, its entry
+  must be exactly "SKIP_INSUFFICIENT_INFO" — never a sentence explaining that info is missing"""
 
     try:
         response = client.messages.create(
@@ -4163,7 +4193,15 @@ def generate_llm_summaries(df: pd.DataFrame) -> pd.DataFrame:
                 logging.info(f"   ✅ {str(df.loc[idx, 'News Title'])[:50]}...")
                 logging.info(f"      → {summary[:80]}...")
 
-    logging.info(f"   ✅ Done: {total} summaries in {total_batches} API calls")
+    insufficient_mask = df['summary'].astype(str).str.strip() == 'SKIP_INSUFFICIENT_INFO'
+    dropped = int(insufficient_mask.sum())
+    if dropped:
+        dropped_titles = df.loc[insufficient_mask, 'News Title'].tolist()
+        for t in dropped_titles:
+            logging.info(f"   🗑️  Dropped (insufficient info): {str(t)[:70]}...")
+        df = df.loc[~insufficient_mask].copy()
+
+    logging.info(f"   ✅ Done: {total - dropped} summaries kept, {dropped} dropped as insufficient-info, {total_batches} API calls")
     return df
 
 
