@@ -765,6 +765,53 @@ def match_generic_event(row1, row2) -> bool:
     return False
 
 
+def llm_same_event_check(row1, row2) -> bool:
+    """
+    Semantic tie-breaker for event clustering.
+
+    The deterministic matchers below (match_order_win_event, match_bidding_event,
+    etc.) compare individually-extracted fingerprint fields — brittle when the
+    LLM extracted a value/location/scope slightly differently across two
+    write-ups of the same story (exactly the SAEL/NTPC failure mode). This
+    function instead reads both articles' titles and known facts *together*
+    and asks directly whether they describe the same real-world event — a
+    semantic judgment, not a field-by-field checklist.
+
+    Only called as a fallback from compare_event_relationship, for pairs that
+    already share a competitor and have real title overlap but failed the
+    deterministic check — this keeps it to a handful of API calls per run,
+    not O(n^2).
+    """
+    t1, t2 = _row_title(row1), _row_title(row2)
+    fp1, fp2 = get_fingerprint_dict(row1), get_fingerprint_dict(row2)
+
+    prompt = f"""Article A title: {t1}
+Article A known facts: {json.dumps(fp1) if fp1 else 'none extracted'}
+
+Article B title: {t2}
+Article B known facts: {json.dumps(fp2) if fp2 else 'none extracted'}
+
+Are Article A and Article B reporting the SAME specific real-world event (the
+same contract, the same tender, the same announcement — not just the same
+company or general topic)? A follow-up, correction, or re-reported version of
+the same event still counts as the same event.
+
+Answer with exactly one word: YES or NO."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=5,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        answer = response.content[0].text.strip().upper()
+        return answer.startswith("YES")
+    except Exception as e:
+        logging.warning(f"llm_same_event_check failed: {e}")
+        return False  # fail safe: don't merge on an error
+
+
 def compare_event_relationship(row1, row2) -> str:
     """Compare two processed article rows and return a relationship type."""
     event_type_1 = get_event_type(row1)
@@ -779,22 +826,30 @@ def compare_event_relationship(row1, row2) -> str:
             return RELATIONSHIP_RELATED_CONTEXT
         return RELATIONSHIP_SEPARATE_EVENT
 
-    if event_type_1 == "order wins":
-        return RELATIONSHIP_SAME_EVENT if match_order_win_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "bidding activity":
-        return RELATIONSHIP_SAME_EVENT if match_bidding_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "financial":
-        return RELATIONSHIP_SAME_EVENT if match_financial_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "mergers & acquisitions":
-        return RELATIONSHIP_SAME_EVENT if match_ma_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "partnerships & alliances":
-        return RELATIONSHIP_SAME_EVENT if match_partnership_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "regulatory & policy":
-        return RELATIONSHIP_SAME_EVENT if match_policy_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
-    if event_type_1 == "project execution":
-        return RELATIONSHIP_SAME_EVENT if match_project_execution_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    deterministic_matchers = {
+        "order wins": match_order_win_event,
+        "bidding activity": match_bidding_event,
+        "financial": match_financial_event,
+        "mergers & acquisitions": match_ma_event,
+        "partnerships & alliances": match_partnership_event,
+        "regulatory & policy": match_policy_event,
+        "project execution": match_project_execution_event,
+    }
+    matcher = deterministic_matchers.get(event_type_1, match_generic_event)
 
-    return RELATIONSHIP_SAME_EVENT if match_generic_event(row1, row2) else RELATIONSHIP_SEPARATE_EVENT
+    if matcher(row1, row2):
+        return RELATIONSHIP_SAME_EVENT
+
+    # Semantic tie-breaker: only spend an API call on genuinely ambiguous
+    # pairs that share a competitor and have real title overlap but the
+    # deterministic field-matching missed.
+    shared_competitor = bool(get_primary_competitor_set(row1) & get_primary_competitor_set(row2))
+    t1, t2 = _row_title(row1), _row_title(row2)
+    if shared_competitor and title_similarity(t1, t2) > 0.40:
+        if llm_same_event_check(row1, row2):
+            return RELATIONSHIP_SAME_EVENT
+
+    return RELATIONSHIP_SEPARATE_EVENT
 
 
 def test_event_matching_on_dataframe(df: pd.DataFrame, max_pairs: int = 100) -> dict:
