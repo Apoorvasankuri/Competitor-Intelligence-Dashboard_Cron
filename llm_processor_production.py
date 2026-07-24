@@ -4062,20 +4062,26 @@ def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
 
 SUMMARY_SYSTEM_PROMPT = """You are a senior competitive intelligence analyst for KEC International, an infrastructure EPC company.
 
-Your job is to write concise 2-3 sentence executive summaries of competitor news articles.
+Your job is to write ONE dense factual sentence per competitor news article.
 
-Structure each summary as:
-- Sentence 1: Who did what (the core event, using the competitor's exact full name)
-- Sentence 2: Scale and context (contract value in ₹, geography, project scope/specs)
+Structure:
+- Exactly one sentence: who did what, plus ₹ value, geography, and scale figures where the article states them.
 
-Report only the facts of the event. Do NOT add strategic implications, competitive-threat commentary, or any sentence about how it affects KEC, its SBUs, or its positioning. State what happened, not what it means for KEC.
+Report ONLY the event. NEVER write a second sentence that explains, elaborates, describes what something "involves", or gives background. If the facts fit in twelve words, use twelve words.
+
+BANNED — never produce sentences of this shape:
+- "The partnership involves leveraging existing fiber assets within the power transmission network for telecommunications applications in India."
+- "The project is part of a broader initiative to..."
+- "This involves / This includes / The deal encompasses / The agreement covers..."
+- Anything opening with "The [noun] involves", "The move", "This marks", "The initiative", "The collaboration aims".
+
+Do NOT add strategic implications, competitive-threat commentary, or any sentence about how it affects KEC, its SBUs, or its positioning. State what happened, not what it means and not what it entails.
 
 Rules:
 - Use the EXACT competitor name from the "Competitor" field — if "-" or empty, infer from content
 - NEVER write "-" or "Unknown" as a company name
 - Be specific: include ₹ values, MW/km figures, location names wherever available
-- Anchor on the pre-extracted facts (fingerprint) first, use raw content only to add colour
-- Keep it under 60 words total
+- Anchor on the pre-extracted facts (fingerprint) first; use raw content only to fill in missing hard numbers, never to add colour or description
 - Write in third person, present tense
 - No filler phrases like "it is worth noting" or "this highlights"
 
@@ -4128,7 +4134,7 @@ Contract Value (INR Crore): {article.get('contract_value_inr_crore') or 'Not spe
 {fp_text}
 Raw content: {content}
 """
-    prompt = f"""Write a 2-3 sentence executive summary for each of these {len(articles_batch)} articles.
+    prompt = f"""Write ONE factual sentence for each of these {len(articles_batch)} articles.
 
 {articles_text}
 
