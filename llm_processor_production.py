@@ -40,7 +40,7 @@ client = Anthropic(api_key=CLAUDE_API_KEY)
 
 # Model
 CLAUDE_MODEL = "claude-sonnet-4-6"
-
+STAGE1_MODEL = "claude-haiku-4-5-20251001"  # cheap model: Stage 1 binary relevance filter
 # Excel mapping file
 EXCEL_MAPPING_FILE = "SBU_Competitor_Mapping.xlsx"
 
@@ -2595,120 +2595,40 @@ Now analyze the provided article."""
 # STAGE 1: QUICK RELEVANCE SCORING
 # ============================================================================
 
-QUICK_SCORE_PROMPT = """You are an expert relevance scorer for KEC International's competitive and market intelligence system, serving senior management for strategic decision-making.
+QUICK_SCORE_PROMPT = """You are a relevance filter for KEC International's competitive intelligence system. Your ONLY job is to decide whether each article is relevant to KEC's business — nothing else.
 
-KEC's platform tracks TWO types of intelligence. Both are valuable. Do NOT require an article to name a competitor to be relevant.
-
-Competitors: L&T, Kalpataru, Sterlite, Tata Projects, NCC, Siemens, ABB, IRCON, RVNL, Shapoorji, PNC, Simplex, Sterling & Wilson, ReNew, Hero Future, etc.
-
-KEC'S CORE BUSINESSES:
+KEC's CORE BUSINESSES:
 - Transmission & Distribution (T&D): power lines, substations, grid infrastructure
 - Transportation: railways, metro, monorail, signaling
 - Civil: buildings, water treatment, industrial facilities, defense infrastructure
 - Renewables: solar parks, wind farms, hybrid, BESS
 - Oil & Gas: pipelines, terminals, storage facilities
 
-TYPE A — COMPETITOR INTELLIGENCE:
-- competitor order wins
-- competitor bidding activity
-- competitor project execution
-- competitor M&A or partnerships
-- competitor capacity expansion
-- competitor financial / order-book commentary
-- competitor new market entry
+Competitors include: L&T, Kalpataru, Sterlite, Tata Projects, NCC, Siemens, ABB, IRCON, RVNL, Shapoorji, PNC, Simplex, Sterling & Wilson, ReNew, Hero Future, and similar EPC / infrastructure players.
 
-TYPE B — MARKET OPPORTUNITY INTELLIGENCE (often does NOT name a competitor):
-- tenders from project authorities (e.g. PGCIL, NTPC, SECI, NHAI, metro/rail bodies)
-- client / authority project announcements
-- government policy approvals
-- budget / capex allocations
-- regulatory schemes
-- transmission project pipeline
-- renewable / BESS tenders
-- metro / rail package announcements
-- oil & gas pipeline tenders
-- infrastructure project awards before the winner is known
-- official filings that may mention orders, contracts, LoA, order book, M&A, or project updates
+An article is RELEVANT (keep) if it involves ANY of:
+- A competitor's order win, bid, project execution, M&A, partnership, capacity expansion, financials, or market entry in a KEC sector
+- A tender, project announcement, or award from a project authority (PGCIL, NTPC, SECI, NHAI, metro/rail bodies, etc.) in a KEC sector
+- A government policy, scheme, budget, or capex allocation materially affecting T&D, rail, metro, renewables, civil, or oil & gas
+- Any infrastructure project opportunity in KEC's sectors, even before a winner is named
+- An official filing (exchange, authority, government, tender portal) mentioning orders, contracts, LoA, order book, M&A, or project updates in a KEC sector
 
-SCORING RULES (0-100):
+An article is NOT RELEVANT (drop) if it is:
+- Stock price movement only, with no operational or project detail
+- CSR, awards, HR, careers, routine board / admin / governance updates
+- Unrelated businesses, subsidiaries, or consumer / IT / finance activity
+- Generic economy or market commentary with no specific KEC-sector project, tender, policy, or competitor impact
 
-90-100: CRITICAL INTELLIGENCE
-- Major competitor order win or bid in KEC sectors
-- Large tender / project package from a major client or authority
-- Official filing announcing a major order, LoA, contract, order-book, M&A, or capex
-- Government approval or policy materially affecting T&D, rail, metro, renewables, civil, or oil & gas
-- Major M&A / JV / strategic partnership in relevant sectors
-- Large BESS, Green Energy Corridor, transmission, metro, rail, civil, or pipeline opportunity
+You are given the article's TITLE and FULL CONTENT. Read the CONTENT, not just the title — many relevant filings and announcements have vague titles. When the source is an official / authority / exchange / tender query (see context fields) and the content plausibly concerns a KEC sector, keep it.
 
-80-89: HIGH RELEVANCE
-- Medium-sized tender or project announcement in KEC sectors
-- Important client / authority update without a named winner
-- Competitor financials with order book, guidance, project pipeline, or segment commentary
-- Specialist media reporting a credible project pipeline or policy movement
-- New market entry by a relevant competitor or client
+For EACH article, produce:
+- "keep": true or false — is this relevant to KEC's business?
+- "context": a one-line note (max 20 words) naming the KEC sector, competitor/authority, and event type that makes it relevant. If keep=false, write "not relevant".
+- "summary": one factual sentence (max 25 words) stating what happened — company/authority, action, value, geography — drawn from the content. If keep=false, write "".
 
-70-79: USEFUL / MONITOR
-- Sector trend with direct relevance to KEC SBUs
-- Early-stage policy or project signal
-- Smaller but relevant project or tender
-- Company announcement that may require follow-up
-- Official source with a vague title but where query / source context suggests possible relevance
+The context and summary exist ONLY to justify the relevance decision. Do not editorialize.
 
-60-69: MONITOR — MARKET SIGNALS
-- State or regional infrastructure project announcement in a KEC sector
-- Smaller tender or package (< ₹500 Cr) in T&D, rail, civil, renewables, or oil & gas
-- Early-stage pipeline signal or government scheme notification
-- Competitor activity in adjacent geographies or new segments
-- Authority or client update without a named winner yet
-- Industry capacity, pricing, or supply chain signal affecting KEC's cost base
-
-40-59: WEAK / CONTEXTUAL
-- Generic infrastructure or energy news with only an indirect connection
-- Stock / market article with limited operational detail
-- Broad economy / capex commentary without specific project or SBU impact
-
-0-39: LOW RELEVANCE / NOISE
-- Stock price movement only
-- CSR, awards, HR, careers, routine board / admin update
-- Unrelated businesses
-- Generic market updates with no KEC-sector relevance
-- Unrelated subsidiaries or consumer / IT / finance activity
-
-HANDLING OFFICIAL / SOURCE-SPECIFIC ARTICLES:
-Each article includes context fields (Search Query, Search Query Type, Accepted By Gate, Source Type, Source Category, Source Authority Score, detected signals). For articles accepted through official / source-specific query types (search_query_type starting with "site_", or an accepted_by_gate indicating an official / exchange / authority / government / tender source):
-- Do NOT penalize the article merely because the title is vague.
-- Official filings and government announcements often have generic titles.
-- Use search_query, search_query_type, accepted_by_gate, source_type, source_category, source_authority_score, and the detected signals as context.
-- If the title is vague but the source / query context is strong, assign AT LEAST monitor-level relevance (70-79) unless the title clearly indicates routine noise.
-- Routine noise includes generic board meetings, HR / careers, CSR, stock-only, unrelated investor admin, or governance updates with no order / project / policy / capex relevance.
-- The later full-analysis stage can validate the details.
-
-MULTI-SIGNAL SCORING (Change 9): For each article, output FOUR independent scores (0-100 each):
-
-1) relevance_score — how directly the news impacts KEC's core competitive landscape and market opportunities.
-
-2) actionability_score — how much this should trigger a concrete BD, tendering, strategy, or execution action at KEC.
-   90-100: immediate action (large competitor order win, direct tender, live bid, PGCIL/NHAI/SECI/DMRC package, government approval affecting KEC pipeline).
-   60-89: follow-up expected (partnerships, capacity expansion, new market entry, sector policy, project execution in KEC geography).
-   30-59: monitor only.
-   0-29: no action expected.
-
-3) confidence_score — how trustworthy and specific the article is.
-   90-100: named competitor, named client, specific value/scope/geography, clear category, credible source description.
-   60-89: some specifics but partial or vague.
-   30-59: generic without concrete facts.
-   0-29: unreliable, promotional, or noise.
-
-4) sbu_fit_score — alignment to KEC's SBU priorities: India T&D, International T&D, Transportation, Civil, Renewables, Oil & Gas.
-   90-100: directly one of KEC's SBUs with strong sector fit.
-   60-89: adjacent or overlapping sector.
-   30-59: broadly related.
-   0-29: unrelated.
-
-When scoring all four, consider source_type, search_query_type, accepted_by_gate, detected_client_authority, and detected_strategic_theme. For site-specific official queries, do not penalize vague titles; use the query context and source_type.
-
-You will be given a batch of articles. Return ONLY a JSON array of objects, each with:
-"id", "relevance_score", "actionability_score", "confidence_score", "sbu_fit_score". No explanation."""
+Return ONLY a JSON array of objects, each with: "id", "keep", "context", "summary". No explanation."""
 
 @retry(
     wait=wait_random_exponential(min=1, max=60),
@@ -2719,8 +2639,9 @@ You will be given a batch of articles. Return ONLY a JSON array of objects, each
 def batch_relevance_score(articles_batch: List[Dict]) -> List[Dict]:
     """Score a batch of articles in a single API call (multi-signal: relevance, actionability, confidence, sbu_fit)."""
     
-    articles_text = ""
+        articles_text = ""
     for article in articles_batch:
+        content = str(article.get('content') or '')[:4000]
         articles_text += f"""
 ID: {article['id']}
 Title: {article.get('title', '')}
@@ -2734,19 +2655,18 @@ Competitor: {article.get('competitor', '')}
 Source Type: {article.get('source_type', 'unknown')}
 Source Category: {article.get('source_category', 'unknown')}
 Source Authority Score: {article.get('source_authority_score', 5)}
-Needs LLM Relevance Validation: {article.get('needs_llm_relevance_validation', False)}
-Content Snippet: {article.get('content_snippet', '')}
+Full Content: {content}
 """
-    
-    prompt = f"""Score these {len(articles_batch)} articles (0-100 each score):
+
+    prompt = f"""Decide relevance for these {len(articles_batch)} articles:
 {articles_text}
 
-Return ONLY a JSON array like: [{{"id": 1, "relevance_score": 85, "actionability_score": 70, "confidence_score": 80, "sbu_fit_score": 75}}, ...]"""
+Return ONLY a JSON array like: [{{"id": 1, "keep": true, "context": "India T&D — Kalpataru order win", "summary": "Kalpataru won a ₹850 Cr PGCIL transmission order in Rajasthan."}}, ...]"""
     
     try:
         response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=len(articles_batch) * 60,
+            model=STAGE1_MODEL,
+            max_tokens=len(articles_batch) * 120,
             temperature=0,
             system=[
                 {
@@ -2787,21 +2707,30 @@ Return ONLY a JSON array like: [{{"id": 1, "relevance_score": 85, "actionability
         score_map = {}
         for item in scores_list:
             article_id = item.get('id')
-            # Backward compat: accept legacy "score" as relevance if present.
-            rel = item.get('relevance_score', item.get('score', 0))
+            keep = bool(item.get('keep', False))
+            # Binary decision mapped onto relevance_score so Stage 2's existing
+            # `relevance_score >= RELEVANCE_THRESHOLD` filter works unchanged:
+            # keep -> 100 (always passes), drop -> 0 (always filtered).
             score_map[article_id] = {
-                'relevance_score': _clamp(rel, 0),
-                'actionability_score': _clamp(item.get('actionability_score', 40), 40),
-                'confidence_score': _clamp(item.get('confidence_score', 50), 50),
-                'sbu_fit_score': _clamp(item.get('sbu_fit_score', 50), 50),
+                'relevance_score': 100 if keep else 0,
+                'actionability_score': 50,
+                'confidence_score': 50,
+                'sbu_fit_score': 50,
+                'stage1_context': str(item.get('context', '') or ''),
+                'stage1_summary': str(item.get('summary', '') or ''),
             }
-        
-        default = {'relevance_score': 0, 'actionability_score': 40, 'confidence_score': 50, 'sbu_fit_score': 50}
+
+        default = {'relevance_score': 0, 'actionability_score': 50, 'confidence_score': 50,
+                   'sbu_fit_score': 50, 'stage1_context': '', 'stage1_summary': ''}
         return [score_map.get(article['id'], dict(default)) for article in articles_batch]
-        
+
     except Exception as e:
-        logging.warning(f"Batch scoring failed: {e}")
-        default = {'relevance_score': 0, 'actionability_score': 40, 'confidence_score': 50, 'sbu_fit_score': 50}
+        logging.warning(f"Batch relevance filtering failed: {e}")
+        # On failure, keep the article (relevance_score=100) so a Haiku/JSON
+        # hiccup never silently drops a potentially relevant article — Stage 2
+        # (Sonnet) will still independently analyze and can discard it there.
+        default = {'relevance_score': 100, 'actionability_score': 50, 'confidence_score': 50,
+                   'sbu_fit_score': 50, 'stage1_context': '', 'stage1_summary': ''}
         return [dict(default) for _ in articles_batch]
 
 
@@ -3220,6 +3149,8 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
                 'source_category': str(row.get('source_category') or 'unknown'),
                 'source_authority_score': row.get('source_authority_score', 5),
                 'needs_llm_relevance_validation': row.get('needs_llm_relevance_validation', False),
+                'content': str(row.get('content') or ''),
+            })
                 'content_snippet': str(row.get('content') or '')[:400],
             })
         all_batches.append((i, articles_batch))
