@@ -2735,6 +2735,7 @@ Source Type: {article.get('source_type', 'unknown')}
 Source Category: {article.get('source_category', 'unknown')}
 Source Authority Score: {article.get('source_authority_score', 5)}
 Needs LLM Relevance Validation: {article.get('needs_llm_relevance_validation', False)}
+Content Snippet: {article.get('content_snippet', '')}
 """
     
     prompt = f"""Score these {len(articles_batch)} articles (0-100 each score):
@@ -3219,6 +3220,7 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
                 'source_category': str(row.get('source_category') or 'unknown'),
                 'source_authority_score': row.get('source_authority_score', 5),
                 'needs_llm_relevance_validation': row.get('needs_llm_relevance_validation', False),
+                'content_snippet': str(row.get('content') or '')[:400],
             })
         all_batches.append((i, articles_batch))
     
