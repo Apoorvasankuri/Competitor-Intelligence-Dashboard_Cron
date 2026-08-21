@@ -51,7 +51,13 @@ MAX_WORKERS = 15
 RATE_LIMIT_DELAY = 0.15
 
 # Relevance threshold
+# Relevance threshold
 RELEVANCE_THRESHOLD = 60
+
+# Stage 0/1 filter models (Option B two-pass content filter)
+STAGE0_MODEL = "claude-haiku-4-5-20251001"  # title-only pre-filter (cheap)
+STAGE1_MODEL = "claude-haiku-4-5-20251001"  # full-content binary relevance filter
+STAGE0_BATCH_SIZE = 30                        # title-only, so bigger batches are fine
 ACTIONABILITY_MIN_FOR_EXECBRIEF = 40
 CONFIDENCE_MIN_FOR_EXECBRIEF = 50
 SBU_FIT_MIN_FOR_EXECBRIEF = 40
@@ -2637,9 +2643,9 @@ Return ONLY a JSON array of objects, each with: "id", "keep", "context", "summar
     reraise=True
 )
 def batch_relevance_score(articles_batch: List[Dict]) -> List[Dict]:
-    """Score a batch of articles in a single API call (multi-signal: relevance, actionability, confidence, sbu_fit)."""
-    
-        articles_text = ""
+    """Score a batch of articles in a single API call (binary relevance filter)."""
+
+    articles_text = ""
     for article in articles_batch:
         content = str(article.get('content') or '')[:4000]
         articles_text += f"""
@@ -3150,8 +3156,6 @@ def stage1_quick_scoring(df: pd.DataFrame) -> pd.DataFrame:
                 'source_authority_score': row.get('source_authority_score', 5),
                 'needs_llm_relevance_validation': row.get('needs_llm_relevance_validation', False),
                 'content': str(row.get('content') or ''),
-            })
-                'content_snippet': str(row.get('content') or '')[:400],
             })
         all_batches.append((i, articles_batch))
     
