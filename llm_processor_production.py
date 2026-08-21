@@ -39,7 +39,7 @@ if not CLAUDE_API_KEY:
 client = Anthropic(api_key=CLAUDE_API_KEY)
 
 # Model
-CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Excel mapping file
 EXCEL_MAPPING_FILE = "SBU_Competitor_Mapping.xlsx"
@@ -60,7 +60,7 @@ SBU_FIT_MIN_FOR_EXECBRIEF = 40
 # now the PRIMARY filter (only 'pending' rows are ever loaded); this date
 # bound just prevents ever reprocessing something absurdly old if a status
 # update silently failed. Independent of scraper_production.SAVE_WINDOW_DAYS.
-LOAD_WINDOW_DAYS = 7
+LOAD_WINDOW_DAYS = 35
 
 # Change 5 Part C: safety cap for O(n^2) in-memory event clustering.
 MAX_EVENT_CLUSTERING_ARTICLES = int(os.getenv("MAX_EVENT_CLUSTERING_ARTICLES", "500"))
