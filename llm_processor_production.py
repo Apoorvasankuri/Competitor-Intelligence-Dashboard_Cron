@@ -51,7 +51,7 @@ MAX_WORKERS = 15
 RATE_LIMIT_DELAY = 0.15
 
 # Relevance threshold
-RELEVANCE_THRESHOLD = 70
+RELEVANCE_THRESHOLD = 60
 ACTIONABILITY_MIN_FOR_EXECBRIEF = 40
 CONFIDENCE_MIN_FOR_EXECBRIEF = 50
 SBU_FIT_MIN_FOR_EXECBRIEF = 40
@@ -2654,8 +2654,16 @@ SCORING RULES (0-100):
 - Company announcement that may require follow-up
 - Official source with a vague title but where query / source context suggests possible relevance
 
-40-69: WEAK / CONTEXTUAL
-- Generic infrastructure or energy news with an indirect connection
+60-69: MONITOR — MARKET SIGNALS
+- State or regional infrastructure project announcement in a KEC sector
+- Smaller tender or package (< ₹500 Cr) in T&D, rail, civil, renewables, or oil & gas
+- Early-stage pipeline signal or government scheme notification
+- Competitor activity in adjacent geographies or new segments
+- Authority or client update without a named winner yet
+- Industry capacity, pricing, or supply chain signal affecting KEC's cost base
+
+40-59: WEAK / CONTEXTUAL
+- Generic infrastructure or energy news with only an indirect connection
 - Stock / market article with limited operational detail
 - Broad economy / capex commentary without specific project or SBU impact
 
